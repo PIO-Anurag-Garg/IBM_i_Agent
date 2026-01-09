@@ -1,0 +1,1 @@
+{"route_agent": "helpdesk", "confidence": 0.0, "reason": "low_confidence_fallback", "secondary_agents": [], "user_query": "provide list of users logged in today.", "actions_enabled": false, "ts": "2026-01-07T07:29:55.673500+00:00", "app": "ibmi-agent-suite"}
