@@ -1,9 +1,12 @@
+# IBM i Performance Agent - Version 7.6
+# Targets IBM i 7.6 with enhanced services, user data access, and program source reading
 
 import os
 import re
+import sys
 import json
 from textwrap import dedent
-from typing import Any, Dict, Optional, List
+from typing import Any, Dict, Optional, List, Sequence, Tuple
 
 from dotenv import load_dotenv
 from mapepire_python import connect
@@ -77,6 +80,36 @@ def run_sql_statement(
             return "SQL executed successfully. No results returned."
 
 
+def run_sql_raw(
+    sql: str,
+    parameters: Optional[QueryParameters] = None,
+    creds: Optional[Dict[str, Any]] = None,
+) -> Any:
+    """
+    Execute SQL and return the raw python object.
+    Useful for capability detection where we need to inspect structured results.
+    """
+    creds = creds or get_ibmi_credentials()
+
+    with connect(creds) as conn:
+        with conn.execute(sql, parameters=parameters) as cur:
+            if getattr(cur, "has_results", False):
+                return cur.fetchall()
+            return None
+
+
+def _as_rows(raw: Any) -> List[Dict[str, Any]]:
+    """
+    Best effort conversion to list-of-dict rows for Mapepire outputs.
+    """
+    if isinstance(raw, dict) and "data" in raw and isinstance(raw["data"], list):
+        return raw["data"]
+    if isinstance(raw, list):
+        # expecting list[dict]
+        return raw
+    return []
+
+
 # =============================================================================
 # SAFETY HELPERS (Prevent SQL injection; allow only safe identifiers & SELECT tools)
 # =============================================================================
@@ -88,7 +121,19 @@ _FORBIDDEN_SQL_TOKENS = re.compile(
     re.IGNORECASE,
 )
 
+# Base system schemas (always allowed)
 _ALLOWED_SCHEMAS = {"QSYS2", "SYSTOOLS", "SYSIBM", "QSYS", "INFORMATION_SCHEMA"}
+
+# Expand with user-defined schemas from environment
+user_schemas = os.getenv("ALLOWED_USER_SCHEMAS", "").strip()
+if user_schemas:
+    user_schemas_list = [s.strip().upper() for s in user_schemas.split(",") if s.strip()]
+    _ALLOWED_SCHEMAS.update(user_schemas_list)
+    print(f"[SECURITY] User schemas enabled: {', '.join(user_schemas_list)}", file=sys.stderr)
+
+# Store original system schemas for reference
+_SYSTEM_SCHEMAS = {"QSYS2", "SYSTOOLS", "SYSIBM", "QSYS", "INFORMATION_SCHEMA"}
+_USER_SCHEMAS = _ALLOWED_SCHEMAS - _SYSTEM_SCHEMAS
 
 
 def _safe_ident(value: str, what: str = "identifier") -> str:
@@ -161,6 +206,43 @@ def run_select(sql: str, parameters: Optional[QueryParameters] = None) -> str:
         return run_sql_statement(sql, parameters=parameters)
     except Exception as e:
         return f"ERROR executing SQL Service/cat query. Details: {type(e).__name__}: {e}"
+
+
+# =============================================================================
+# IBM i 7.6 SERVICE DISCOVERY (from 7.3 compatibility layer)
+# =============================================================================
+
+SERVICES_INFO_EXISTS_SQL = """
+SELECT 1 AS X
+FROM QSYS2.SERVICES_INFO
+WHERE SERVICE_SCHEMA_NAME = ?
+  AND SERVICE_NAME = ?
+FETCH FIRST 1 ROWS ONLY
+"""
+
+_services_cache: Dict[Tuple[str, str], bool] = {}
+
+
+def service_exists(schema: str, service_name: str) -> bool:
+    """
+    Check for service presence via QSYS2.SERVICES_INFO.
+    This catalog is the supported way to determine IBM i Services availability.
+    """
+    sch = _safe_schema(schema)
+    svc = _safe_ident(service_name, what="service_name")
+    key = (sch, svc)
+    if key in _services_cache:
+        return _services_cache[key]
+
+    try:
+        raw = run_sql_raw(SERVICES_INFO_EXISTS_SQL, parameters=[sch, svc])
+        rows = _as_rows(raw)
+        ok = len(rows) > 0
+    except Exception:
+        ok = False
+
+    _services_cache[key] = ok
+    return ok
 
 
 # =============================================================================
@@ -515,6 +597,100 @@ FETCH FIRST ? ROWS ONLY
 HTTP_GET_VERBOSE_SQL = "SELECT * FROM TABLE(QSYS2.HTTP_GET_VERBOSE(?)) X"
 HTTP_POST_VERBOSE_SQL = "SELECT * FROM TABLE(QSYS2.HTTP_POST_VERBOSE(?, ?)) X"
 
+# =============================================================================
+# IBM i 7.6 NEW SERVICES SQL TEMPLATES
+# =============================================================================
+
+AUTHORITY_COLLECTION_IFS_SQL = """
+SELECT *
+FROM TABLE(QSYS2.AUTHORITY_COLLECTION_IFS())
+WHERE PATH_NAME LIKE ?
+ORDER BY PATH_NAME, AUTHORIZATION_NAME
+FETCH FIRST ? ROWS ONLY
+"""
+
+VERIFY_NAME_SQL = """
+SELECT *
+FROM TABLE(QSYS2.VERIFY_NAME(?))
+"""
+
+SQLSTATE_INFO_SQL = """
+SELECT *
+FROM TABLE(QSYS2.SQLSTATE_INFO(?))
+"""
+
+DUMP_PLAN_CACHE_QRO_SQL = """
+SELECT *
+FROM TABLE(QSYS2.DUMP_PLAN_CACHE(QRO_HASH => ?))
+"""
+
+CERTIFICATE_USAGE_INFO_SQL = """
+SELECT *
+FROM TABLE(SYSTOOLS.CERTIFICATE_USAGE_INFO())
+WHERE CERTIFICATE_STORE LIKE ?
+FETCH FIRST ? ROWS ONLY
+"""
+
+USER_MFA_INFO_SQL = """
+SELECT AUTHORIZATION_NAME,
+       TOTP_AUTHENTICATION_LEVEL,
+       TOTP_KEY_STATUS,
+       TOTP_KEY_GENERATION_TIMESTAMP
+FROM QSYS2.USER_INFO
+WHERE (? = '*ALL' OR AUTHORIZATION_NAME = ?)
+FETCH FIRST ? ROWS ONLY
+"""
+
+SUBSYSTEM_ROUTING_INFO_SQL = """
+SELECT *
+FROM QSYS2.SUBSYSTEM_ROUTING_INFO
+WHERE (? IS NULL OR SUBSYSTEM_NAME = ?)
+FETCH FIRST ? ROWS ONLY
+"""
+
+# =============================================================================
+# PROGRAM SOURCE CODE ANALYSIS SQL TEMPLATES
+# =============================================================================
+
+PROGRAM_SOURCE_INFO_SQL = """
+SELECT OBJLONGSCHEMA AS LIBRARY,
+       OBJNAME AS PROGRAM,
+       SOURCE_LIBRARY,
+       SOURCE_FILE,
+       SOURCE_MEMBER,
+       OBJCREATED,
+       TEXT_DESCRIPTION
+FROM TABLE(QSYS2.OBJECT_STATISTICS(?, '*PGM *SRVPGM *MODULE'))
+WHERE OBJNAME = ?
+  AND SOURCE_FILE IS NOT NULL
+FETCH FIRST ? ROWS ONLY
+"""
+
+SOURCE_MEMBER_INFO_SQL = """
+SELECT SYSTEM_TABLE_SCHEMA,
+       SYSTEM_TABLE_NAME,
+       SYSTEM_TABLE_MEMBER,
+       SOURCE_TYPE,
+       NUMBER_ROWS,
+       PARTITION_TEXT
+FROM QSYS2.SYSMEMBERSTAT
+WHERE SYSTEM_TABLE_SCHEMA = ?
+  AND SYSTEM_TABLE_NAME = ?
+  AND SYSTEM_TABLE_MEMBER = ?
+"""
+
+PROGRAM_REFERENCES_SQL = """
+SELECT FROM_OBJECT_SCHEMA,
+       FROM_OBJECT_NAME,
+       TO_OBJECT_SCHEMA,
+       TO_OBJECT_NAME,
+       REFERENCE_TYPE
+FROM QSYS2.PROGRAM_REFERENCES
+WHERE FROM_OBJECT_SCHEMA = ?
+  AND FROM_OBJECT_NAME = ?
+FETCH FIRST ? ROWS ONLY
+"""
+
 LARGEST_OBJECTS_SQL = """
 SELECT OBJLONGSCHEMA AS LIBRARY,
        OBJNAME AS OBJECT,
@@ -586,7 +762,7 @@ FETCH FIRST ? ROWS ONLY
 """
 
 # =============================================================================
-# GENERIC HELPERS (runbook/checklist templates)
+# GENERIC HELPERS (runbook/checklist templates + user query builder)
 # =============================================================================
 
 def _render_template(title: str, bullets: List[str]) -> str:
@@ -594,6 +770,21 @@ def _render_template(title: str, bullets: List[str]) -> str:
     for b in bullets:
         lines.append(f"- {b}")
     return "\n".join(lines)
+
+
+def _build_user_table_query(schema: str, table: str, where_clause: str = "",
+                           order_by: str = "", limit: int = 100) -> str:
+    """
+    Build a safe SELECT query for user tables.
+    All identifiers must be validated before calling this.
+    """
+    base = f"SELECT * FROM {schema}.{table}"
+    if where_clause:
+        base += f" WHERE {where_clause}"
+    if order_by:
+        base += f" ORDER BY {order_by}"
+    base += f" FETCH FIRST {limit} ROWS ONLY"
+    return base
 
 
 # =============================================================================
@@ -927,6 +1118,255 @@ def generate_checklist(checklist_type: str) -> str:
 
 
 # =============================================================================
+# IBM i 7.6 SERVICES (NEW TOOLS)
+# =============================================================================
+
+@tool(name="ifs-authority-collection", description="Analyze IFS object authorities using QSYS2.AUTHORITY_COLLECTION_IFS (7.6/7.5 TR6+).")
+def ifs_authority_collection(path_pattern: str = "%", limit: int = 200) -> str:
+    """
+    Returns authority collection data for IFS objects.
+    path_pattern: IFS path pattern (supports %)
+    """
+    if not service_exists("QSYS2", "AUTHORITY_COLLECTION_IFS"):
+        return "ERROR: AUTHORITY_COLLECTION_IFS not available. Requires IBM i 7.6 or 7.5 TR6+."
+
+    lim = _safe_limit(limit, default=200, max_n=5000)
+    return run_select(AUTHORITY_COLLECTION_IFS_SQL, parameters=[path_pattern, lim])
+
+
+@tool(name="verify-name", description="Validate system or SQL name using QSYS2.VERIFY_NAME (7.6/7.5 TR6+).")
+def verify_name(name_to_check: str) -> str:
+    """
+    Checks if a name is valid as system object name or SQL name.
+    """
+    if not service_exists("QSYS2", "VERIFY_NAME"):
+        return "ERROR: VERIFY_NAME not available. Requires IBM i 7.6 or 7.5 TR6+."
+
+    return run_select(VERIFY_NAME_SQL, parameters=[name_to_check])
+
+
+@tool(name="lookup-sqlstate", description="Get information about SQLSTATE values using QSYS2.SQLSTATE_INFO (7.6/7.5 TR6+).")
+def lookup_sqlstate(sqlstate: str) -> str:
+    """
+    Returns detailed information about a specific SQLSTATE value.
+    """
+    if not service_exists("QSYS2", "SQLSTATE_INFO"):
+        return "ERROR: SQLSTATE_INFO not available. Requires IBM i 7.6 or 7.5 TR6+."
+
+    if len(sqlstate) != 5:
+        raise ValueError("SQLSTATE must be exactly 5 characters")
+
+    return run_select(SQLSTATE_INFO_SQL, parameters=[sqlstate])
+
+
+@tool(name="dump-plan-cache-qro", description="Dump plan cache for specific QRO_HASH using enhanced QSYS2.DUMP_PLAN_CACHE (7.6).")
+def dump_plan_cache_qro(qro_hash: int) -> str:
+    """
+    Enhanced DUMP_PLAN_CACHE with QRO_HASH filtering (7.6 only).
+    qro_hash: 64-bit QRO hash value (BIGINT)
+    """
+    if not service_exists("QSYS2", "DUMP_PLAN_CACHE"):
+        return "ERROR: DUMP_PLAN_CACHE not available."
+
+    return run_select(DUMP_PLAN_CACHE_QRO_SQL, parameters=[qro_hash])
+
+
+@tool(name="certificate-usage-info", description="Show digital certificate usage using SYSTOOLS.CERTIFICATE_USAGE_INFO (7.5 TR1+).")
+def certificate_usage_info(store_pattern: str = "%", limit: int = 100) -> str:
+    """
+    Returns certificate usage information from certificate stores.
+    """
+    if not service_exists("SYSTOOLS", "CERTIFICATE_USAGE_INFO"):
+        return "ERROR: CERTIFICATE_USAGE_INFO not available. Requires IBM i 7.5 TR1+."
+
+    lim = _safe_limit(limit, default=100, max_n=5000)
+    return run_select(CERTIFICATE_USAGE_INFO_SQL, parameters=[store_pattern, lim])
+
+
+@tool(name="user-mfa-settings", description="Show MFA/TOTP settings for user profiles using QSYS2.USER_INFO (7.6/7.5 TR6+).")
+def user_mfa_settings(user_profile: str = "*ALL", limit: int = 500) -> str:
+    """
+    Returns MFA authentication settings for user profiles.
+    user_profile: Specific user or *ALL
+    """
+    lim = _safe_limit(limit, default=500, max_n=5000)
+
+    if user_profile.upper() == "*ALL":
+        return run_select(USER_MFA_INFO_SQL, parameters=["*ALL", "", lim])
+    else:
+        usr = _safe_ident(user_profile, what="user_profile")
+        return run_select(USER_MFA_INFO_SQL, parameters=[usr, usr, lim])
+
+
+@tool(name="subsystem-routing-info", description="Show subsystem routing entries using QSYS2.SUBSYSTEM_ROUTING_INFO (7.6).")
+def subsystem_routing_info(subsystem: str = "", limit: int = 500) -> str:
+    """
+    Returns routing entries for subsystems.
+    """
+    if not service_exists("QSYS2", "SUBSYSTEM_ROUTING_INFO"):
+        return "ERROR: SUBSYSTEM_ROUTING_INFO not available. Requires IBM i 7.6."
+
+    lim = _safe_limit(limit, default=500, max_n=5000)
+
+    if subsystem:
+        sbs = _safe_ident(subsystem, what="subsystem")
+        return run_select(SUBSYSTEM_ROUTING_INFO_SQL, parameters=[sbs, sbs, lim])
+    else:
+        return run_select(SUBSYSTEM_ROUTING_INFO_SQL, parameters=[None, None, lim])
+
+
+# =============================================================================
+# PROGRAM SOURCE CODE ANALYSIS (NEW TOOLS)
+# =============================================================================
+
+@tool(name="get-program-source-info", description="Get source file location for a program using QSYS2.OBJECT_STATISTICS.")
+def get_program_source_info(library: str, program: str, limit: int = 10) -> str:
+    """
+    Returns source file metadata (library, file, member) for a program.
+    Works for *PGM, *SRVPGM, *MODULE objects.
+    """
+    lib = _safe_ident(library, what="library")
+    pgm = _safe_ident(program, what="program")
+    lim = _safe_limit(limit, default=10, max_n=100)
+
+    return run_select(PROGRAM_SOURCE_INFO_SQL, parameters=[lib, pgm, lim])
+
+
+@tool(name="read-source-member", description="Read source code from a source physical file member.")
+def read_source_member(library: str, source_file: str, member: str, limit: int = 1000) -> str:
+    """
+    Reads actual source code lines from a source physical file member.
+    Returns up to 'limit' lines of source code.
+
+    SAFETY: This respects schema whitelist - source file must be in allowed schema.
+    """
+    lib = _safe_schema(library)  # Validates against whitelist
+    srcf = _safe_ident(source_file, what="source_file")
+    mbr = _safe_ident(member, what="member")
+    lim = _safe_limit(limit, default=1000, max_n=10000)
+
+    # Log if reading from user schema
+    if lib in _USER_SCHEMAS:
+        print(f"[USER_SCHEMA_ACCESS] Reading source: {lib}/{srcf}({mbr})", file=sys.stderr)
+
+    try:
+        # Get member metadata
+        metadata = run_select(SOURCE_MEMBER_INFO_SQL, parameters=[lib, srcf, mbr])
+
+        # Read source lines
+        sql = f"SELECT SRCSEQ, SRCDAT, SRCDTA FROM {lib}.{srcf} ORDER BY SRCSEQ FETCH FIRST {lim} ROWS ONLY"
+        source = run_select(sql)
+
+        return f"=== Member Metadata ===\n{metadata}\n\n=== Source Code ===\n{source}"
+    except Exception as e:
+        return f"ERROR reading source member. Details: {type(e).__name__}: {e}"
+
+
+@tool(name="analyze-program-dependencies", description="Show what objects a program references using QSYS2.PROGRAM_REFERENCES.")
+def analyze_program_dependencies(library: str, program: str, limit: int = 500) -> str:
+    """
+    Returns list of objects referenced by a program (calls, file usage, etc.).
+    """
+    if not service_exists("QSYS2", "PROGRAM_REFERENCES"):
+        return "ERROR: PROGRAM_REFERENCES not available. May require IBM i 7.4+ or PTF."
+
+    lib = _safe_ident(library, what="library")
+    pgm = _safe_ident(program, what="program")
+    lim = _safe_limit(limit, default=500, max_n=5000)
+
+    return run_select(PROGRAM_REFERENCES_SQL, parameters=[lib, pgm, lim])
+
+
+# =============================================================================
+# USER SCHEMA / BUSINESS DATA ACCESS (NEW TOOLS)
+# =============================================================================
+
+@tool(name="query-user-table", description="Query business data from user-defined tables (requires ALLOWED_USER_SCHEMAS).")
+def query_user_table(schema: str, table: str, where_clause: str = "",
+                     order_by: str = "", limit: int = 100) -> str:
+    """
+    Flexible query tool for user business data.
+
+    Examples:
+    - "top 3 orders from yesterday":
+      schema=ORDERLIB, where_clause="ORDER_DATE >= CURRENT_DATE - 1 DAY",
+      order_by="ORDER_TOTAL DESC", limit=3
+
+    - "customers by revenue":
+      schema=CUSTLIB, table=CUSTOMERS, order_by="TOTAL_REVENUE DESC", limit=100
+
+    SAFETY: Only works if schema is in ALLOWED_USER_SCHEMAS environment variable.
+    """
+    sch = _safe_schema(schema)
+    tbl = _safe_ident(table, what="table")
+    lim = _safe_limit(limit, default=100, max_n=5000)
+
+    # Verify schema is in whitelist
+    if sch not in _ALLOWED_SCHEMAS:
+        return f"ERROR: Schema {sch} is not in allowed schemas. " \
+               f"System schemas: {sorted(_SYSTEM_SCHEMAS)}. " \
+               f"User schemas: {sorted(_USER_SCHEMAS)}. " \
+               f"To enable: Set ALLOWED_USER_SCHEMAS={sch} in .env"
+
+    # Validate WHERE and ORDER BY don't contain dangerous tokens
+    if where_clause:
+        if _FORBIDDEN_SQL_TOKENS.search(where_clause):
+            raise ValueError("Forbidden SQL operation in WHERE clause")
+
+    if order_by:
+        # Basic validation - should only be column names and ASC/DESC
+        if _FORBIDDEN_SQL_TOKENS.search(order_by) or "(" in order_by:
+            raise ValueError("Forbidden SQL operation in ORDER BY clause")
+
+    # Log user schema access
+    if sch in _USER_SCHEMAS:
+        print(f"[USER_SCHEMA_ACCESS] Query: {sch}.{tbl}, WHERE={where_clause}, ORDER BY={order_by}, LIMIT={lim}",
+              file=sys.stderr)
+
+    # Build dynamic query
+    sql = _build_user_table_query(sch, tbl, where_clause, order_by, lim)
+
+    return run_select(sql)
+
+
+@tool(name="describe-user-table", description="Describe columns of a user table using QSYS2.SYSCOLUMNS.")
+def describe_user_table(schema: str, table: str) -> str:
+    """
+    Returns column metadata for a user table.
+    Same as describe-table but with explicit user-schema logging.
+    """
+    sch = _safe_schema(schema)
+    tbl = _safe_ident(table, what="table")
+
+    if sch not in _ALLOWED_SCHEMAS:
+        return f"ERROR: Schema {sch} is not in allowed schemas."
+
+    if sch in _USER_SCHEMAS:
+        print(f"[USER_SCHEMA_ACCESS] Describe table: {sch}.{tbl}", file=sys.stderr)
+
+    return run_select(SYSCOLUMNS_FOR_TABLE_SQL, parameters=[sch, tbl, 5000])
+
+
+@tool(name="count-user-table-rows", description="Count rows in a user table (fast metadata query).")
+def count_user_table_rows(schema: str, table: str) -> str:
+    """
+    Returns row count for a table using metadata.
+    Fast operation that doesn't scan the table.
+    """
+    sch = _safe_schema(schema)
+    tbl = _safe_ident(table, what="table")
+
+    if sch not in _ALLOWED_SCHEMAS:
+        return f"ERROR: Schema {sch} is not in allowed schemas."
+
+    if sch in _USER_SCHEMAS:
+        print(f"[USER_SCHEMA_ACCESS] Count rows: {sch}.{tbl}", file=sys.stderr)
+
+    sql = "SELECT NUMBER_ROWS, NUMBER_DELETED_ROWS, DATA_SIZE FROM QSYS2.SYSTABLESTAT WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?"
+    return run_select(sql, parameters=[sch, tbl])
+
+
+# =============================================================================
 # SINGLE SUPER AGENT
 # =============================================================================
 
@@ -971,14 +1411,26 @@ def build_super_agent() -> Agent:
 
         # Templates
         generate_runbook, generate_checklist,
+
+        # IBM i 7.6 Services (NEW)
+        ifs_authority_collection, verify_name, lookup_sqlstate,
+        dump_plan_cache_qro, certificate_usage_info, user_mfa_settings,
+        subsystem_routing_info,
+
+        # Program Source Analysis (NEW)
+        get_program_source_info, read_source_member,
+        analyze_program_dependencies,
+
+        # User Data Access (NEW)
+        query_user_table, describe_user_table, count_user_table_rows,
     ]
 
     return Agent(
-        name="IBM i Super Assistant (All-in-One)",
+        name="IBM i Super Assistant (7.6 Edition)",
         model=Claude(id=model_id),
         tools=all_tools,
         instructions=dedent("""
-        You are an expert IBM i Super Assistant.
+        You are an expert IBM i Super Assistant (IBM i 7.6 Edition).
 
         Core rules:
         - Use ONLY the provided tools to fetch IBM i system data.
@@ -987,20 +1439,45 @@ def build_super_agent() -> Agent:
         - If a tool returns an ERROR (missing service, permissions, etc.):
           explain it clearly and propose alternatives (e.g., search-sql-services).
 
+        IBM i 7.6 Enhancements:
+        - NEW: IFS authority analysis (ifs-authority-collection)
+        - NEW: Name validation (verify-name)
+        - NEW: SQLSTATE lookup (lookup-sqlstate)
+        - NEW: Enhanced plan cache (dump-plan-cache-qro)
+        - NEW: Certificate tracking (certificate-usage-info)
+        - NEW: MFA settings (user-mfa-settings)
+        - NEW: Subsystem routing (subsystem-routing-info)
+
+        User Schema Access (Business Data):
+        - If ALLOWED_USER_SCHEMAS is configured, you can query user business data
+        - Use: query-user-table, describe-user-table, count-user-table-rows
+        - Examples: "top 3 orders from yesterday", "customers by revenue"
+        - All user schema queries are logged for audit purposes
+
+        Program Source Code:
+        - Use get-program-source-info to find where source code lives
+        - Use read-source-member to read actual source code
+        - Use analyze-program-dependencies to see what a program calls
+
         Default mode:
         - Read-only analysis and recommendations.
         - Provide operationally safe guidance (plans/checklists/runbooks), not destructive execution.
 
         How to choose tools (examples):
-        - Performance/CPU slowness: get-system-status, get-system-activity, top-cpu-jobs, lock-waits, plan-cache-top
+        - Performance/CPU slowness: get-system-status, get-system-activity, top-cpu-jobs, lock-waits, plan-cache-top, dump-plan-cache-qro
         - Jobs stuck/hangs: jobs-in-msgw, qsysopr-messages, ended-jobs
         - Disk growth/space: get-asp-info, disk-hotspots, output-queue-hotspots, library-sizes, largest-objects, ifs-largest-objects
         - PTF/IPL readiness: ptfs-requiring-ipl, software-products, license-info
-        - Security posture: list-privileged-profiles, public-all-object-authority, object-privileges, authorization-lists
+        - Security posture: list-privileged-profiles, public-all-object-authority, object-privileges, authorization-lists, user-mfa-settings
         - Db2 SQL tuning: plan-cache-top, plan-cache-errors, index-advice, schema-table-stats, table-index-stats
         - Journaling/HA/DR: journals, journal-receivers, generate-runbook
         - REST integration: http-get-verbose, http-post-verbose
         - Metadata discovery: list-tables-in-schema, describe-table, list-routines-in-schema
+        - IFS security: ifs-authority-collection
+        - Program analysis: get-program-source-info, read-source-member, analyze-program-dependencies
+        - Business data: query-user-table, describe-user-table, count-user-table-rows
+        - Name validation: verify-name
+        - Error diagnosis: lookup-sqlstate
 
         Output format (always):
         - Summary
@@ -1022,7 +1499,7 @@ def main() -> None:
 
     agent = build_super_agent()
 
-    print("\n✅ IBM i Super Agent is ready (single agent, all tools).")
+    print("\n✅ IBM i Super Agent is ready (IBM i 7.6 Edition - 55 tools).")
     print("Try questions like:")
     print(" - 'What are the top CPU jobs right now?'")
     print(" - 'Any jobs stuck in MSGW? Show details.'")
@@ -1032,6 +1509,14 @@ def main() -> None:
     print(" - 'Show plan cache top SQL and index advice.'")
     print(" - 'Generate a DR runbook.'")
     print(" - 'List tables in schema MYLIB and describe table X.'")
+    print("\nIBM i 7.6 NEW:")
+    print(" - 'Show IFS authority for /home/myuser'")
+    print(" - 'What are the MFA settings for users?'")
+    print(" - 'Verify the name MYLIB123 is valid'")
+    print(" - 'Look up SQLSTATE 42501'")
+    print(" - 'Get source info for MYLIB.MYPGM'")
+    print(" - 'Read source from QGPL/QRPGLESRC member MYPGM'")
+    print(" - 'Query top 10 from PRODDATA.ORDERS by ORDER_DATE DESC'")
     print("\nType a question (or 'exit' to quit).\n")
 
     while True:
