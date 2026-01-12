@@ -62,6 +62,45 @@ The AI agent will automatically:
 - Custom SQL query execution (read-only with safety guardrails)
 - Optional performance metrics logging
 
+## 🆕 What's New in IBM i 7.6 Edition
+
+### IBM i 7.6 Native Services (10 new tools)
+- **IFS Authority Analysis**: Track who can access IFS objects (`ifs-authority-collection`)
+- **Name Validation**: Verify system and SQL object names (`verify-name`)
+- **SQLSTATE Lookup**: Decode error codes instantly (`lookup-sqlstate`)
+- **Enhanced Plan Cache**: Filter by QRO_HASH for 64-bit query optimization hash (`dump-plan-cache-qro`)
+- **MFA Settings**: Inspect multi-factor authentication status for user profiles (`user-mfa-settings`)
+- **Certificate Usage**: Track digital certificate deployment across applications (`certificate-usage-info`)
+- **Subsystem Routing**: Detailed routing entry analysis (`subsystem-routing-info`)
+
+### Business Data Queries (User Schema Access)
+Query your application tables directly with natural language:
+
+**Examples:**
+- "Show top 10 customers by revenue"
+- "List orders from yesterday with status PENDING"
+- "Count rows in PRODDATA.INVENTORY"
+- "Top 3 orders from yesterday by order total"
+
+**Configuration:** Set `ALLOWED_USER_SCHEMAS=MYLIB,PRODDATA` in `.env` to enable access to your business data schemas.
+
+**Safety:** All user schema queries are logged for audit purposes and maintain read-only restrictions.
+
+### Program Source Code Reading
+Analyze program source without leaving the AI chat:
+
+**Capabilities:**
+- Find where source code lives for any program (`get-program-source-info`)
+- Read actual source code (RPG, COBOL, CL, etc.) (`read-source-member`)
+- Analyze program dependencies and call chains (`analyze-program-dependencies`)
+
+**Use Cases:**
+- "Show me the source code for program MYLIB/CALCPRICE"
+- "What does PAYROLL/PAYRUN call?"
+- "Get source location for QGPL/MYPGM"
+
+**Note:** Source code must still exist in source physical files. Compiled programs without source are not readable.
+
 ## 🔒 Safety First
 
 This agent is **read-only by default**. It includes multiple safety mechanisms:
