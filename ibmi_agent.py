@@ -143,6 +143,26 @@ def _safe_ident(value: str, what: str = "identifier") -> str:
     return v.upper()
 
 
+def _safe_ident_or_special(value: str, what: str = "identifier") -> str:
+    """
+    Like _safe_ident but also allows IBM i special values like *ALL, *ALLSIMPLE, *LIBL, etc.
+    Used for library parameters that accept special values in QSYS2.OBJECT_STATISTICS.
+    """
+    v = (value or "").strip()
+    if not v:
+        raise ValueError(f"Invalid {what}: {value!r}")
+    # Allow normal identifiers OR IBM i special values starting with *
+    if v.startswith("*"):
+        # Validate special value format: *WORD (alphanumeric after asterisk)
+        if not re.match(r"^\*[A-Z0-9_]+$", v, re.IGNORECASE):
+            raise ValueError(f"Invalid {what}: {value!r}")
+        return v.upper()
+    # Otherwise use normal identifier validation
+    if not _SAFE_IDENT.match(v):
+        raise ValueError(f"Invalid {what}: {value!r}")
+    return v.upper()
+
+
 def _safe_schema(value: str) -> str:
     v = (value or "").strip()
     if not v or not _SAFE_SCHEMA.match(v):
@@ -201,9 +221,12 @@ def _looks_like_safe_select(sql: str) -> None:
 
 def run_select(sql: str, parameters: Optional[QueryParameters] = None) -> str:
     """Execute safe read-only SELECT/WITH query with guardrails and friendly errors."""
-    _looks_like_safe_select(sql)
     try:
+        _looks_like_safe_select(sql)
         return run_sql_statement(sql, parameters=parameters)
+    except ValueError as e:
+        # Validation errors - return clean error message without stack trace
+        return f"ERROR: {e}"
     except Exception as e:
         return f"ERROR executing SQL Service/cat query. Details: {type(e).__name__}: {e}"
 
@@ -988,7 +1011,7 @@ def http_post_verbose(url: str, body: str) -> str:
 # --- Library / Object sizing ---
 @tool(name="largest-objects", description="Find largest objects in a library using QSYS2.OBJECT_STATISTICS.")
 def largest_objects(library: str, limit: int = 50) -> str:
-    lib = _safe_ident(library, what="library")
+    lib = _safe_ident_or_special(library, what="library")
     lim = _safe_limit(limit, default=50, max_n=5000)
     return run_select(LARGEST_OBJECTS_SQL, parameters=[lib, lim])
 
@@ -1224,8 +1247,10 @@ def get_program_source_info(library: str, program: str, limit: int = 10) -> str:
     """
     Returns source file metadata (library, file, member) for a program.
     Works for *PGM, *SRVPGM, *MODULE objects.
+
+    Use library='*ALL' to search all libraries, or specify a library name.
     """
-    lib = _safe_ident(library, what="library")
+    lib = _safe_ident_or_special(library, what="library")
     pgm = _safe_ident(program, what="program")
     lim = _safe_limit(limit, default=10, max_n=100)
 
@@ -1297,36 +1322,41 @@ def query_user_table(schema: str, table: str, where_clause: str = "",
 
     SAFETY: Only works if schema is in ALLOWED_USER_SCHEMAS environment variable.
     """
-    sch = _safe_schema(schema)
-    tbl = _safe_ident(table, what="table")
-    lim = _safe_limit(limit, default=100, max_n=5000)
+    try:
+        sch = _safe_schema(schema)
+        tbl = _safe_ident(table, what="table")
+        lim = _safe_limit(limit, default=100, max_n=5000)
 
-    # Verify schema is in whitelist
-    if sch not in _ALLOWED_SCHEMAS:
-        return f"ERROR: Schema {sch} is not in allowed schemas. " \
-               f"System schemas: {sorted(_SYSTEM_SCHEMAS)}. " \
-               f"User schemas: {sorted(_USER_SCHEMAS)}. " \
-               f"To enable: Set ALLOWED_USER_SCHEMAS={sch} in .env"
+        # Verify schema is in whitelist
+        if sch not in _ALLOWED_SCHEMAS:
+            return f"ERROR: Schema {sch} is not in allowed schemas. " \
+                   f"System schemas: {sorted(_SYSTEM_SCHEMAS)}. " \
+                   f"User schemas: {sorted(_USER_SCHEMAS)}. " \
+                   f"To enable: Set ALLOWED_USER_SCHEMAS={sch} in .env"
 
-    # Validate WHERE and ORDER BY don't contain dangerous tokens
-    if where_clause:
-        if _FORBIDDEN_SQL_TOKENS.search(where_clause):
-            raise ValueError("Forbidden SQL operation in WHERE clause")
+        # Validate WHERE and ORDER BY don't contain dangerous tokens
+        if where_clause:
+            if _FORBIDDEN_SQL_TOKENS.search(where_clause):
+                return "ERROR: Forbidden SQL operation in WHERE clause"
 
-    if order_by:
-        # Basic validation - should only be column names and ASC/DESC
-        if _FORBIDDEN_SQL_TOKENS.search(order_by) or "(" in order_by:
-            raise ValueError("Forbidden SQL operation in ORDER BY clause")
+        if order_by:
+            # Basic validation - should only be column names and ASC/DESC
+            if _FORBIDDEN_SQL_TOKENS.search(order_by) or "(" in order_by:
+                return "ERROR: Forbidden SQL operation in ORDER BY clause"
 
-    # Log user schema access
-    if sch in _USER_SCHEMAS:
-        print(f"[USER_SCHEMA_ACCESS] Query: {sch}.{tbl}, WHERE={where_clause}, ORDER BY={order_by}, LIMIT={lim}",
-              file=sys.stderr)
+        # Log user schema access
+        if sch in _USER_SCHEMAS:
+            print(f"[USER_SCHEMA_ACCESS] Query: {sch}.{tbl}, WHERE={where_clause}, ORDER BY={order_by}, LIMIT={lim}",
+                  file=sys.stderr)
 
-    # Build dynamic query
-    sql = _build_user_table_query(sch, tbl, where_clause, order_by, lim)
+        # Build dynamic query
+        sql = _build_user_table_query(sch, tbl, where_clause, order_by, lim)
 
-    return run_select(sql)
+        return run_select(sql)
+    except ValueError as e:
+        return f"ERROR: {e}"
+    except Exception as e:
+        return f"ERROR: {type(e).__name__}: {e}"
 
 
 @tool(name="describe-user-table", description="Describe columns of a user table using QSYS2.SYSCOLUMNS.")
