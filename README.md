@@ -1,6 +1,6 @@
 # IBM i Performance Agent 🤖
 
-An AI-powered assistant for IBM i system administrators and developers. This intelligent agent uses Claude (Anthropic's AI model) to help you monitor, analyze, and troubleshoot your IBM i systems through natural language conversations.
+An AI-powered assistant for IBM i system administrators and developers. This intelligent agent uses OpenAI's GPT-5-mini model to help you monitor, analyze, and troubleshoot your IBM i systems through natural language conversations.
 
 ## 🎯 What Does This Do?
 
@@ -131,9 +131,9 @@ Before you begin, ensure you have the following:
 - A text editor or IDE (VS Code, PyCharm, etc.)
 
 ### 3. API Keys
-- **Anthropic API Key** - Get one from [Anthropic Console](https://console.anthropic.com/)
+- **OpenAI API Key** - Get one from [OpenAI Platform](https://platform.openai.com/)
   - You'll need to create an account and add payment information
-  - Claude models are pay-per-use (very affordable for this use case)
+  - GPT models are pay-per-use (GPT-5-mini is very cost-effective)
 
 ### 4. Network Access
 - Your workstation must be able to connect to the IBM i system
@@ -199,14 +199,14 @@ With the virtual environment activated, install all dependencies:
 
 ```bash
 pip install --upgrade pip
-pip install python-dotenv mapepire-python agno anthropic
+pip install python-dotenv mapepire-python agno openai
 ```
 
 **Package explanations:**
 - `python-dotenv`: Loads environment variables from .env file
 - `mapepire-python`: Python client for IBM i database access
 - `agno`: AI agent framework for tool calling and orchestration
-- `anthropic`: Official Anthropic API client for Claude models
+- `openai`: Official OpenAI API client for GPT models
 
 ### Step 4: Configure Environment Variables
 
@@ -227,21 +227,22 @@ pip install python-dotenv mapepire-python agno anthropic
    IBMI_PORT=8076
    IBMI_USER=your_username
    IBMI_PASSWORD=your_password
-   
+
    # Set to true if using self-signed certificates
    IBMI_IGNORE_UNAUTHORIZED=true
-   
-   # Anthropic API Configuration
-   ANTHROPIC_API_KEY=sk-ant-api03-your-actual-api-key-here
-   
-   # Claude Model Selection
-   # Haiku is faster and cheaper, Sonnet is more capable
-   CLAUDE_MODEL_ID=claude-haiku-4-5-20251001
-   # CLAUDE_MODEL_ID=claude-sonnet-4-5-20250929
-   
+
+   # OpenAI API Configuration
+   OPENAI_API_KEY=sk-your-actual-api-key-here
+
+   # OpenAI Model Selection
+   # GPT-5-mini is fast and cost-effective, GPT-4o is more capable
+   OPENAI_MODEL_ID=gpt-5-mini
+   # OPENAI_MODEL_ID=gpt-4o
+   # OPENAI_MODEL_ID=gpt-4o-mini
+
    # Optional: Report output directory
    # REPORT_BASE_DIR=./reports
-   
+
    # Optional: Advanced tuning
    # ROUTER_CONFIDENCE_THRESHOLD=0.65
    # ROUTER_AUDIT_LOG=router_audit.jsonl
@@ -252,7 +253,7 @@ pip install python-dotenv mapepire-python agno anthropic
    **Important Notes:**
    - Replace `IBMI_HOST` with your actual IBM i hostname or IP address
    - Replace `IBMI_USER` and `IBMI_PASSWORD` with your IBM i credentials
-   - Replace `ANTHROPIC_API_KEY` with your actual API key from Anthropic
+   - Replace `OPENAI_API_KEY` with your actual API key from OpenAI
    - The `.env` file is ignored by Git and will NOT be committed (it's in .gitignore)
 
 ### Step 5: Verify Installation
@@ -337,21 +338,26 @@ You> What's consuming the most disk I/O?
 
 ### Model Selection
 
-Choose between different Claude models based on your needs:
+Choose between different OpenAI models based on your needs:
 
-- **claude-haiku-4-5-20251001** (Default)
-  - Fastest responses
-  - Most cost-effective
+- **gpt-5-mini** (Default)
+  - Fast responses
+  - Most cost-effective ($0.25/$2 per 1M tokens)
   - Great for routine monitoring
+  - 400K context window
 
-- **claude-sonnet-4-5-20250929**
+- **gpt-4o**
   - More sophisticated analysis
   - Better at complex reasoning
-  - Slightly higher cost
+  - Higher cost
+
+- **gpt-4o-mini**
+  - Balance of speed and capability
+  - Good for most use cases
 
 Edit in `.env`:
 ```dotenv
-CLAUDE_MODEL_ID=claude-sonnet-4-5-20250929
+OPENAI_MODEL_ID=gpt-4o
 ```
 
 ### Optional Features
@@ -409,15 +415,15 @@ IBM_i_Agent/
 - Check if user profile is enabled (not disabled)
 - Test credentials with another tool (ODBC, SSH, etc.)
 
-### Anthropic API Errors
+### OpenAI API Errors
 
 **Problem:** `Invalid API key` or `Rate limit exceeded`
 
 **Solutions:**
 - Verify API key is correct in `.env` file
-- Check your Anthropic account has available credits
+- Check your OpenAI account has available credits
 - Ensure API key hasn't expired or been revoked
-- Visit [Anthropic Console](https://console.anthropic.com/) to check status
+- Visit [OpenAI Platform](https://platform.openai.com/) to check status
 
 ### Missing Python Packages
 
@@ -426,7 +432,7 @@ IBM_i_Agent/
 **Solutions:**
 - Ensure virtual environment is activated (you should see `(.venv)`)
 - Reinstall packages: `pip install -r requirements.txt`
-- Or install individually: `pip install python-dotenv mapepire-python agno anthropic`
+- Or install individually: `pip install python-dotenv mapepire-python agno openai`
 
 ### Permission Errors on IBM i
 
@@ -461,7 +467,7 @@ This project is provided as-is for educational and operational purposes. Please 
 
 - **IBM i Services** (QSYS2) - The foundation for system introspection
 - **Mapepire** - Python connectivity to IBM i
-- **Anthropic** - Claude AI models powering the intelligence
+- **OpenAI** - GPT AI models powering the intelligence
 - **Agno Framework** - Agent orchestration and tool management
 
 ## 📞 Support
@@ -487,7 +493,7 @@ This project is provided as-is for educational and operational purposes. Please 
 - [ ] Dependencies installed (`pip install ...`)
 - [ ] Mapepire server running on IBM i
 - [ ] IBM i credentials obtained
-- [ ] Anthropic API key obtained
+- [ ] OpenAI API key obtained
 - [ ] `.env` file created and configured
 - [ ] Successfully ran `python ibmi_agent.py`
 - [ ] Asked first question and got response!

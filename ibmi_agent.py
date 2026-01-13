@@ -13,7 +13,7 @@ from mapepire_python import connect
 from pep249 import QueryParameters
 
 from agno.agent import Agent
-from agno.models.anthropic import Claude
+from agno.models.openai import OpenAIChat
 from agno.tools import tool
 
 # =============================================================================
@@ -1401,7 +1401,7 @@ def count_user_table_rows(schema: str, table: str) -> str:
 # =============================================================================
 
 def build_super_agent() -> Agent:
-    model_id = os.getenv("CLAUDE_MODEL_ID", "claude-haiku-4-5-20251001")
+    model_id = os.getenv("OPENAI_MODEL_ID", "gpt-5-mini")
 
     all_tools = [
         # Ops / Observability
@@ -1457,7 +1457,7 @@ def build_super_agent() -> Agent:
 
     return Agent(
         name="IBM i Super Assistant (7.6 Edition)",
-        model=Claude(id=model_id),
+        model=OpenAIChat(id=model_id),
         tools=all_tools,
         instructions=dedent("""
         You are an expert IBM i Super Assistant (IBM i 7.6 Edition).
@@ -1525,7 +1525,7 @@ def build_super_agent() -> Agent:
 
 def main() -> None:
     _ = get_ibmi_credentials()
-    _ = _require_env("ANTHROPIC_API_KEY")
+    _ = _require_env("OPENAI_API_KEY")
 
     agent = build_super_agent()
 

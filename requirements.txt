@@ -1,0 +1,5 @@
+python-dotenv
+mapepire-python
+pep249
+agno
+openai
