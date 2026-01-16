@@ -13,7 +13,7 @@ from mapepire_python import connect
 from pep249 import QueryParameters
 
 from agno.agent import Agent
-from agno.models.openai import OpenAIChat
+from agno.models.openrouter import OpenRouter
 from agno.tools import tool
 
 # =============================================================================
@@ -1401,7 +1401,7 @@ def count_user_table_rows(schema: str, table: str) -> str:
 # =============================================================================
 
 def build_super_agent() -> Agent:
-    model_id = os.getenv("OPENAI_MODEL_ID", "gpt-5-mini")
+    model_id = os.getenv("OPENROUTER_MODEL_ID", "google/gemini-3-flash-preview")
 
     all_tools = [
         # Ops / Observability
@@ -1457,7 +1457,7 @@ def build_super_agent() -> Agent:
 
     return Agent(
         name="IBM i Super Assistant (7.6 Edition)",
-        model=OpenAIChat(id=model_id),
+        model=OpenRouter(id=model_id),
         tools=all_tools,
         instructions=dedent("""
         You are an expert IBM i Super Assistant (IBM i 7.6 Edition).
@@ -1525,7 +1525,7 @@ def build_super_agent() -> Agent:
 
 def main() -> None:
     _ = get_ibmi_credentials()
-    _ = _require_env("OPENAI_API_KEY")
+    _ = _require_env("OPENROUTER_API_KEY")
 
     agent = build_super_agent()
 

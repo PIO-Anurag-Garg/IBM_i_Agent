@@ -1,6 +1,6 @@
 # IBM i Performance Agent 🤖
 
-An AI-powered assistant for IBM i system administrators and developers. This intelligent agent uses OpenAI's GPT-5-mini model to help you monitor, analyze, and troubleshoot your IBM i systems through natural language conversations.
+An AI-powered assistant for IBM i system administrators and developers. This intelligent agent uses OpenRouter (access to 200+ AI models including Google Gemini, OpenAI GPT, Anthropic Claude, and more) to help you monitor, analyze, and troubleshoot your IBM i systems through natural language conversations.
 
 ## 🎯 What Does This Do?
 
@@ -131,9 +131,10 @@ Before you begin, ensure you have the following:
 - A text editor or IDE (VS Code, PyCharm, etc.)
 
 ### 3. API Keys
-- **OpenAI API Key** - Get one from [OpenAI Platform](https://platform.openai.com/)
-  - You'll need to create an account and add payment information
-  - GPT models are pay-per-use (GPT-5-mini is very cost-effective)
+- **OpenRouter API Key** - Get one from [OpenRouter](https://openrouter.ai/settings/keys)
+  - Sign in with Google, GitHub, or email
+  - Access 200+ AI models through a single API key
+  - Pay-per-use pricing, switch models anytime
 
 ### 4. Network Access
 - Your workstation must be able to connect to the IBM i system
@@ -205,8 +206,8 @@ pip install python-dotenv mapepire-python agno openai
 **Package explanations:**
 - `python-dotenv`: Loads environment variables from .env file
 - `mapepire-python`: Python client for IBM i database access
-- `agno`: AI agent framework for tool calling and orchestration
-- `openai`: Official OpenAI API client for GPT models
+- `agno`: AI agent framework for tool calling and orchestration (includes OpenRouter support)
+- `openai`: Required dependency for API compatibility
 
 ### Step 4: Configure Environment Variables
 
@@ -231,21 +232,21 @@ pip install python-dotenv mapepire-python agno openai
    # Set to true if using self-signed certificates
    IBMI_IGNORE_UNAUTHORIZED=true
 
-   # OpenAI API Configuration
-   OPENAI_API_KEY=sk-your-actual-api-key-here
+   # OpenRouter API Configuration (access 200+ models)
+   OPENROUTER_API_KEY=sk-or-your-actual-api-key-here
 
-   # OpenAI Model Selection
-   # GPT-5-mini is fast and cost-effective, GPT-4o is more capable
-   OPENAI_MODEL_ID=gpt-5-mini
-   # OPENAI_MODEL_ID=gpt-4o
-   # OPENAI_MODEL_ID=gpt-4o-mini
+   # Model Selection - change to use any model from OpenRouter
+   OPENROUTER_MODEL_ID=google/gemini-3-flash-preview
+   # Other options:
+   # OPENROUTER_MODEL_ID=openai/gpt-4o
+   # OPENROUTER_MODEL_ID=anthropic/claude-sonnet-4
+   # OPENROUTER_MODEL_ID=deepseek/deepseek-chat-v3-0324
+   # See all: https://openrouter.ai/models
 
    # Optional: Report output directory
    # REPORT_BASE_DIR=./reports
 
    # Optional: Advanced tuning
-   # ROUTER_CONFIDENCE_THRESHOLD=0.65
-   # ROUTER_AUDIT_LOG=router_audit.jsonl
    # ENABLE_DB_AUDIT_LOG=0
    # ENABLE_ACTION_TOOLS=0
    ```
@@ -253,7 +254,7 @@ pip install python-dotenv mapepire-python agno openai
    **Important Notes:**
    - Replace `IBMI_HOST` with your actual IBM i hostname or IP address
    - Replace `IBMI_USER` and `IBMI_PASSWORD` with your IBM i credentials
-   - Replace `OPENAI_API_KEY` with your actual API key from OpenAI
+   - Replace `OPENROUTER_API_KEY` with your API key from [OpenRouter](https://openrouter.ai/settings/keys)
    - The `.env` file is ignored by Git and will NOT be committed (it's in .gitignore)
 
 ### Step 5: Verify Installation
@@ -338,26 +339,34 @@ You> What's consuming the most disk I/O?
 
 ### Model Selection
 
-Choose between different OpenAI models based on your needs:
+OpenRouter gives you access to 200+ AI models. Choose any model based on your needs:
 
-- **gpt-5-mini** (Default)
-  - Fast responses
-  - Most cost-effective ($0.25/$2 per 1M tokens)
+- **google/gemini-3-flash-preview** (Default)
+  - Fast responses from Google
+  - Cost-effective
   - Great for routine monitoring
-  - 400K context window
 
-- **gpt-4o**
-  - More sophisticated analysis
-  - Better at complex reasoning
-  - Higher cost
+- **openai/gpt-4o**
+  - Strong all-around performance
+  - Good at complex reasoning
 
-- **gpt-4o-mini**
-  - Balance of speed and capability
-  - Good for most use cases
+- **anthropic/claude-sonnet-4**
+  - Balanced performance
+  - Excellent at analysis
+
+- **deepseek/deepseek-chat-v3-0324**
+  - Very cost-effective
+  - Good for most tasks
+
+- **meta-llama/llama-4-maverick**
+  - Open source option
+  - Community-driven
+
+Browse all 200+ models: https://openrouter.ai/models
 
 Edit in `.env`:
 ```dotenv
-OPENAI_MODEL_ID=gpt-4o
+OPENROUTER_MODEL_ID=openai/gpt-4o
 ```
 
 ### Optional Features
@@ -415,15 +424,16 @@ IBM_i_Agent/
 - Check if user profile is enabled (not disabled)
 - Test credentials with another tool (ODBC, SSH, etc.)
 
-### OpenAI API Errors
+### OpenRouter API Errors
 
 **Problem:** `Invalid API key` or `Rate limit exceeded`
 
 **Solutions:**
-- Verify API key is correct in `.env` file
-- Check your OpenAI account has available credits
+- Verify API key is correct in `.env` file (should start with `sk-or-`)
+- Check your OpenRouter account has available credits
 - Ensure API key hasn't expired or been revoked
-- Visit [OpenAI Platform](https://platform.openai.com/) to check status
+- Visit [OpenRouter Dashboard](https://openrouter.ai/settings/keys) to check status
+- Try a different model if the current one is unavailable
 
 ### Missing Python Packages
 
@@ -467,7 +477,7 @@ This project is provided as-is for educational and operational purposes. Please 
 
 - **IBM i Services** (QSYS2) - The foundation for system introspection
 - **Mapepire** - Python connectivity to IBM i
-- **OpenAI** - GPT AI models powering the intelligence
+- **OpenRouter** - AI model gateway providing access to 200+ models
 - **Agno Framework** - Agent orchestration and tool management
 
 ## 📞 Support
@@ -493,7 +503,7 @@ This project is provided as-is for educational and operational purposes. Please 
 - [ ] Dependencies installed (`pip install ...`)
 - [ ] Mapepire server running on IBM i
 - [ ] IBM i credentials obtained
-- [ ] OpenAI API key obtained
+- [ ] OpenRouter API key obtained
 - [ ] `.env` file created and configured
 - [ ] Successfully ran `python ibmi_agent.py`
 - [ ] Asked first question and got response!
