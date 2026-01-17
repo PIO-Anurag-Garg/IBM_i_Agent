@@ -62,9 +62,23 @@ The AI agent will automatically:
 - Custom SQL query execution (read-only with safety guardrails)
 - Optional performance metrics logging
 
-## 🆕 What's New in IBM i 7.6 Edition
+## 🆕 What's New in IBM i 7.5/7.6 Edition (70+ Tools)
 
-### IBM i 7.6 Native Services (10 new tools)
+### IBM i 7.5 Enhanced Tools (15 new tools)
+- **Security Audit**: System-wide security configuration (`security-info`)
+- **Transaction Monitoring**: Active transactions and deadlock detection (`db-transaction-info`)
+- **Enhanced Job Info**: Jobs with SQL text and QRO hash (`active-jobs-detailed`)
+- **Network Diagnostics**: Network connections with owning jobs (`netstat-job-info`)
+- **Job Log Analysis**: Read job log messages via SQL (`joblog-info`)
+- **Spool Monitoring**: Spooled file (print) analysis (`spooled-file-info`)
+- **IFS Storage**: IFS object statistics and large files (`ifs-object-stats`)
+- **IFS Lock Diagnostics**: Who's locking an IFS file (`ifs-object-locks`)
+- **System Values**: Query and search system values (`system-values`)
+- **Library List**: Current job's library list (`library-list-info`)
+- **Hardware Inventory**: Hardware resource configuration (`hardware-resource-info`)
+- **HTTP Methods**: Extended HTTP PATCH and DELETE (`http-patch-verbose`, `http-delete-verbose`)
+
+### IBM i 7.6 Native Services (15 new tools)
 - **IFS Authority Analysis**: Track who can access IFS objects (`ifs-authority-collection`)
 - **Name Validation**: Verify system and SQL object names (`verify-name`)
 - **SQLSTATE Lookup**: Decode error codes instantly (`lookup-sqlstate`)
@@ -72,6 +86,10 @@ The AI agent will automatically:
 - **MFA Settings**: Inspect multi-factor authentication status for user profiles (`user-mfa-settings`)
 - **Certificate Usage**: Track digital certificate deployment across applications (`certificate-usage-info`)
 - **Subsystem Routing**: Detailed routing entry analysis (`subsystem-routing-info`)
+- **Fast Job Query**: Quick active job snapshot (`active-jobs-full`)
+- **Disk Config**: Disk block size and protection info (`disk-block-size-info`)
+- **Memory Pools**: Subsystem memory pool allocations (`subsystem-pool-info`)
+- **PTF Chains**: PTF supersession tracking (`ptf-supersession`)
 
 ### Business Data Queries (User Schema Access)
 Query your application tables directly with natural language:

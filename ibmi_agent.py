@@ -54,10 +54,88 @@ def get_ibmi_credentials() -> Dict[str, Any]:
     return creds
 
 
+# =============================================================================
+# CONNECTION POOLING & RETRY LOGIC
+# =============================================================================
+
+import time as _time
+
+_connection_pool: List[Any] = []
+_MAX_POOL_SIZE = int(os.getenv("IBMI_POOL_SIZE", "5"))
+_MAX_RETRIES = 3
+_RETRY_DELAY_BASE = 2  # Exponential backoff base (seconds)
+
+
+def _get_pooled_connection() -> Any:
+    """
+    Get a connection from the pool or create a new one with retry logic.
+    Implements exponential backoff for transient failures.
+    """
+    creds = get_ibmi_credentials()
+
+    for attempt in range(_MAX_RETRIES):
+        try:
+            # Try to reuse pooled connection first
+            if _connection_pool:
+                conn = _connection_pool.pop()
+                # Test if connection is still valid
+                try:
+                    return conn
+                except Exception:
+                    pass  # Connection stale, create new one
+
+            # Create new connection
+            return connect(creds)
+        except Exception as e:
+            if attempt == _MAX_RETRIES - 1:
+                raise  # Last attempt failed, propagate error
+            # Exponential backoff
+            delay = _RETRY_DELAY_BASE ** attempt
+            print(f"[CONNECTION] Retry {attempt + 1}/{_MAX_RETRIES} after {delay}s: {e}", file=sys.stderr)
+            _time.sleep(delay)
+
+    # Fallback (should not reach here)
+    return connect(creds)
+
+
+def _return_connection_to_pool(conn: Any) -> None:
+    """Return a connection to the pool if there's room."""
+    if len(_connection_pool) < _MAX_POOL_SIZE:
+        _connection_pool.append(conn)
+    else:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+# =============================================================================
+# RESULT SIZE LIMITS
+# =============================================================================
+
+MAX_RESULT_ROWS = int(os.getenv("MAX_RESULT_ROWS", "500"))
+MAX_RESULT_BYTES = int(os.getenv("MAX_RESULT_BYTES", "100000"))  # 100KB default
+
+
 def format_mapepire_result(result: Any) -> str:
-    """Return readable JSON for the agent to interpret."""
+    """Return readable JSON for the agent to interpret with size limits."""
     try:
-        return json.dumps(result, indent=2, default=str)
+        # Apply row limit if result is a list
+        truncated = False
+        if isinstance(result, list) and len(result) > MAX_RESULT_ROWS:
+            result = result[:MAX_RESULT_ROWS]
+            truncated = True
+
+        output = json.dumps(result, indent=2, default=str)
+
+        # Apply byte limit
+        if len(output) > MAX_RESULT_BYTES:
+            output = output[:MAX_RESULT_BYTES] + "\n... (truncated due to size)"
+            truncated = True
+        elif truncated:
+            output += f"\n... (truncated to {MAX_RESULT_ROWS} rows)"
+
+        return output
     except Exception:
         return str(result)
 
@@ -219,6 +297,32 @@ def _looks_like_safe_select(sql: str) -> None:
             )
 
 
+def _validate_simple_clause(clause: str, clause_type: str) -> str:
+    """
+    Validate WHERE or ORDER BY clauses to prevent SQL injection.
+    Rejects parentheses (prevents subqueries) and SELECT keyword.
+    Returns the validated clause or raises ValueError.
+    """
+    if not clause:
+        return ""
+    clause = clause.strip()
+    if not clause:
+        return ""
+    # Reject parentheses - prevents subqueries, function calls that could be exploited
+    if "(" in clause or ")" in clause:
+        raise ValueError(f"Parentheses not allowed in {clause_type} clause (security restriction)")
+    # Reject SELECT keyword - prevents subqueries
+    if re.search(r'\bSELECT\b', clause, re.IGNORECASE):
+        raise ValueError(f"SELECT keyword not allowed in {clause_type} clause (security restriction)")
+    # Reject semicolons - prevents statement chaining
+    if ";" in clause:
+        raise ValueError(f"Semicolons not allowed in {clause_type} clause (security restriction)")
+    # Also check for forbidden tokens
+    if _FORBIDDEN_SQL_TOKENS.search(clause):
+        raise ValueError(f"Forbidden SQL operation in {clause_type} clause")
+    return clause
+
+
 def run_select(sql: str, parameters: Optional[QueryParameters] = None) -> str:
     """Execute safe read-only SELECT/WITH query with guardrails and friendly errors."""
     try:
@@ -244,16 +348,51 @@ FETCH FIRST 1 ROWS ONLY
 """
 
 _services_cache: Dict[Tuple[str, str], bool] = {}
+_services_preloaded: bool = False
+
+
+def preload_services() -> int:
+    """
+    Preload all available services at startup for faster tool execution.
+    Returns count of services loaded.
+    """
+    global _services_preloaded, _services_cache
+
+    if _services_preloaded:
+        return len(_services_cache)
+
+    try:
+        sql = "SELECT SERVICE_SCHEMA_NAME, SERVICE_NAME FROM QSYS2.SERVICES_INFO"
+        raw = run_sql_raw(sql)
+        rows = _as_rows(raw)
+        for row in rows:
+            schema = row.get("SERVICE_SCHEMA_NAME", "").upper()
+            name = row.get("SERVICE_NAME", "").upper()
+            if schema and name:
+                _services_cache[(schema, name)] = True
+        _services_preloaded = True
+        print(f"[SERVICES] Preloaded {len(_services_cache)} IBM i services", file=sys.stderr)
+        return len(_services_cache)
+    except Exception as e:
+        print(f"[SERVICES] Preload failed (will check on-demand): {e}", file=sys.stderr)
+        return 0
 
 
 def service_exists(schema: str, service_name: str) -> bool:
     """
     Check for service presence via QSYS2.SERVICES_INFO.
     This catalog is the supported way to determine IBM i Services availability.
+    Uses preloaded cache if available, falls back to on-demand query.
     """
     sch = _safe_schema(schema)
     svc = _safe_ident(service_name, what="service_name")
     key = (sch, svc)
+
+    # If preloaded, use cache directly (absence means service doesn't exist)
+    if _services_preloaded:
+        return key in _services_cache
+
+    # Fallback to on-demand check with caching
     if key in _services_cache:
         return _services_cache[key]
 
@@ -619,6 +758,102 @@ FETCH FIRST ? ROWS ONLY
 
 HTTP_GET_VERBOSE_SQL = "SELECT * FROM TABLE(QSYS2.HTTP_GET_VERBOSE(?)) X"
 HTTP_POST_VERBOSE_SQL = "SELECT * FROM TABLE(QSYS2.HTTP_POST_VERBOSE(?, ?)) X"
+HTTP_PATCH_VERBOSE_SQL = "SELECT * FROM TABLE(QSYS2.HTTP_PATCH_VERBOSE(?, ?)) X"
+HTTP_DELETE_VERBOSE_SQL = "SELECT * FROM TABLE(QSYS2.HTTP_DELETE_VERBOSE(?)) X"
+
+# =============================================================================
+# IBM i 7.5 NEW SERVICES SQL TEMPLATES
+# =============================================================================
+
+SECURITY_INFO_SQL = "SELECT * FROM QSYS2.SECURITY_INFO"
+
+DB_TRANSACTION_INFO_SQL = """
+SELECT JOB_NAME, AUTHORIZATION_NAME, COMMIT_DEFINITION_NAME,
+       LOCAL_START_TIMESTAMP, STATE, LOCK_SCOPE, LOCK_TIMEOUT
+FROM QSYS2.DB_TRANSACTION_INFO
+ORDER BY LOCAL_START_TIMESTAMP DESC
+FETCH FIRST ? ROWS ONLY
+"""
+
+ACTIVE_JOBS_DETAILED_SQL = """
+SELECT JOB_NAME, AUTHORIZATION_NAME AS USER_NAME, SUBSYSTEM,
+       JOB_STATUS, JOB_TYPE, CPU_TIME, ELAPSED_TIME,
+       TEMPORARY_STORAGE, MEMORY_POOL, FUNCTION_TYPE, FUNCTION,
+       SQL_STATEMENT_TEXT
+FROM TABLE(QSYS2.ACTIVE_JOB_INFO(DETAILED_INFO => 'WORK'))
+WHERE CPU_TIME > 0
+ORDER BY CPU_TIME DESC
+FETCH FIRST ? ROWS ONLY
+"""
+
+NETSTAT_JOB_INFO_SQL = """
+SELECT JOB_NAME, AUTHORIZATION_NAME AS USER_NAME, JOB_NUMBER,
+       LOCAL_ADDRESS, LOCAL_PORT, REMOTE_ADDRESS, REMOTE_PORT,
+       TCP_STATE, BYTES_SENT, BYTES_RECEIVED
+FROM QSYS2.NETSTAT_JOB_INFO
+WHERE TCP_STATE = 'ESTABLISHED'
+ORDER BY BYTES_SENT DESC
+FETCH FIRST ? ROWS ONLY
+"""
+
+JOBLOG_INFO_SQL = """
+SELECT MESSAGE_ID, MESSAGE_TYPE, MESSAGE_TIMESTAMP,
+       FROM_PROGRAM, FROM_MODULE, MESSAGE_SEVERITY,
+       CAST(MESSAGE_TEXT AS VARCHAR(1024)) AS MESSAGE_TEXT
+FROM TABLE(QSYS2.JOBLOG_INFO(?))
+WHERE MESSAGE_SEVERITY >= ?
+ORDER BY MESSAGE_TIMESTAMP DESC
+FETCH FIRST ? ROWS ONLY
+"""
+
+SPOOLED_FILE_INFO_SQL = """
+SELECT JOB_NAME, JOB_USER, JOB_NUMBER,
+       SPOOLED_FILE_NAME, OUTPUT_QUEUE_LIBRARY_NAME, OUTPUT_QUEUE_NAME,
+       STATUS, TOTAL_PAGES, SIZE, CREATE_TIMESTAMP
+FROM TABLE(QSYS2.SPOOLED_FILE_INFO())
+ORDER BY SIZE DESC
+FETCH FIRST ? ROWS ONLY
+"""
+
+IFS_OBJECT_STATISTICS_SQL = """
+SELECT PATH_NAME, OBJECT_TYPE, DATA_SIZE, ALLOCATED_SIZE,
+       OBJECT_OWNER, CREATE_TIMESTAMP, ACCESS_TIMESTAMP, DATA_CHANGE_TIMESTAMP
+FROM TABLE(QSYS2.IFS_OBJECT_STATISTICS(
+    START_PATH_NAME => ?,
+    SUBTREE_DIRECTORIES => 'YES'
+))
+WHERE DATA_SIZE > ?
+ORDER BY DATA_SIZE DESC
+FETCH FIRST ? ROWS ONLY
+"""
+
+IFS_OBJECT_LOCK_INFO_SQL = """
+SELECT PATH_NAME, JOB_NAME, LOCK_TYPE, LOCK_SCOPE, LOCK_STATE
+FROM TABLE(QSYS2.IFS_OBJECT_LOCK_INFO(?))
+"""
+
+SYSTEM_VALUE_INFO_SQL = """
+SELECT SYSTEM_VALUE_NAME, CURRENT_NUMERIC_VALUE, CURRENT_CHARACTER_VALUE,
+       TEXT_DESCRIPTION
+FROM QSYS2.SYSTEM_VALUE_INFO
+WHERE (? = '*ALL' OR SYSTEM_VALUE_NAME LIKE ?)
+ORDER BY SYSTEM_VALUE_NAME
+FETCH FIRST ? ROWS ONLY
+"""
+
+LIBRARY_LIST_INFO_SQL = """
+SELECT ORDINAL_POSITION, LIBRARY_NAME, LIBRARY_TYPE, SCHEMA_SIZE
+FROM QSYS2.LIBRARY_LIST_INFO
+ORDER BY ORDINAL_POSITION
+"""
+
+HARDWARE_RESOURCE_INFO_SQL = """
+SELECT RESOURCE_NAME, RESOURCE_TYPE, RESOURCE_KIND,
+       HARDWARE_STATUS, SYSTEM_RESOURCE_NAME
+FROM QSYS2.HARDWARE_RESOURCE_INFO
+ORDER BY RESOURCE_TYPE, RESOURCE_NAME
+FETCH FIRST ? ROWS ONLY
+"""
 
 # =============================================================================
 # IBM i 7.6 NEW SERVICES SQL TEMPLATES
@@ -668,6 +903,43 @@ SUBSYSTEM_ROUTING_INFO_SQL = """
 SELECT *
 FROM QSYS2.SUBSYSTEM_ROUTING_INFO
 WHERE (? IS NULL OR SUBSYSTEM_NAME = ?)
+FETCH FIRST ? ROWS ONLY
+"""
+
+ACTIVE_JOBS_FULL_SQL = """
+SELECT JOB_NAME, AUTHORIZATION_NAME AS USER_NAME, SUBSYSTEM,
+       JOB_STATUS, JOB_TYPE, CPU_TIME, MEMORY_POOL
+FROM TABLE(QSYS2.ACTIVE_JOB_INFO(DETAILED_INFO => 'FULL'))
+WHERE JOB_STATUS = 'ACTIVE'
+ORDER BY CPU_TIME DESC
+FETCH FIRST ? ROWS ONLY
+"""
+
+DISK_BLOCK_SIZE_SQL = """
+SELECT UNIT_NUMBER, UNIT_TYPE, DISK_CAPACITY, PERCENT_USED,
+       TOTAL_READ_REQUESTS, TOTAL_WRITE_REQUESTS,
+       PROTECTION_TYPE, PROTECTION_STATUS
+FROM QSYS2.SYSDISKSTAT
+ORDER BY PERCENT_USED DESC
+FETCH FIRST ? ROWS ONLY
+"""
+
+SUBSYSTEM_POOL_INFO_SQL = """
+SELECT SUBSYSTEM_DESCRIPTION_LIBRARY, SUBSYSTEM_DESCRIPTION,
+       POOL_ID, POOL_NAME, DEFINED_SIZE, CURRENT_SIZE,
+       ACTIVITY_LEVEL, PAGING_OPTION
+FROM QSYS2.SUBSYSTEM_POOL_INFO
+ORDER BY SUBSYSTEM_DESCRIPTION, POOL_ID
+FETCH FIRST ? ROWS ONLY
+"""
+
+PTF_SUPERSESSION_SQL = """
+SELECT PTF_IDENTIFIER, PTF_PRODUCT_ID, PTF_IPL_REQUIRED,
+       PTF_LOADED_STATUS, PTF_APPLIED_STATUS,
+       SUPERSEDING_PTF, SUPERSEDED_BY_PTF
+FROM QSYS2.PTF_INFO
+WHERE SUPERSEDED_BY_PTF IS NOT NULL
+ORDER BY PTF_PRODUCT_ID, PTF_IDENTIFIER
 FETCH FIRST ? ROWS ONLY
 """
 
@@ -932,10 +1204,15 @@ def public_all_object_authority(limit: int = 200) -> str:
 
 @tool(name="object-privileges", description="Show privileges for a specific object (schema/object) using QSYS2.OBJECT_PRIVILEGES.")
 def object_privileges(schema: str, object_name: str, limit: int = 2000) -> str:
-    sch = _safe_schema(schema)
-    obj = _safe_ident(object_name, what="object_name")
-    lim = _safe_limit(limit, default=2000, max_n=20000)
-    return run_select(OBJECT_PRIVILEGES_FOR_OBJECT_SQL, parameters=[sch, obj, lim])
+    try:
+        sch = _safe_schema(schema)
+        obj = _safe_ident(object_name, what="object_name")
+        lim = _safe_limit(limit, default=2000, max_n=20000)
+        return run_select(OBJECT_PRIVILEGES_FOR_OBJECT_SQL, parameters=[sch, obj, lim])
+    except ValueError as e:
+        return f"ERROR: {e}"
+    except Exception as e:
+        return f"ERROR: {type(e).__name__}: {e}"
 
 @tool(name="authorization-lists", description="List authorization lists using QSYS2.AUTHORIZATION_LIST_INFO.")
 def authorization_lists(limit: int = 500) -> str:
@@ -944,10 +1221,15 @@ def authorization_lists(limit: int = 500) -> str:
 
 @tool(name="authorization-list-entries", description="List entries in an authorization list using QSYS2.AUTHORIZATION_LIST_ENTRIES.")
 def authorization_list_entries(auth_list_lib: str, auth_list_name: str, limit: int = 5000) -> str:
-    lib = _safe_ident(auth_list_lib, what="auth_list_lib")
-    name = _safe_ident(auth_list_name, what="auth_list_name")
-    lim = _safe_limit(limit, default=5000, max_n=50000)
-    return run_select(AUTH_LIST_ENTRIES_SQL, parameters=[lib, name, lim])
+    try:
+        lib = _safe_ident(auth_list_lib, what="auth_list_lib")
+        name = _safe_ident(auth_list_name, what="auth_list_name")
+        lim = _safe_limit(limit, default=5000, max_n=50000)
+        return run_select(AUTH_LIST_ENTRIES_SQL, parameters=[lib, name, lim])
+    except ValueError as e:
+        return f"ERROR: {e}"
+    except Exception as e:
+        return f"ERROR: {type(e).__name__}: {e}"
 
 # --- SQL Performance ---
 @tool(name="plan-cache-top", description="Top SQL statements by elapsed time using QSYS2.PLAN_CACHE_STATEMENT (if available).")
@@ -967,16 +1249,26 @@ def index_advice(limit: int = 200) -> str:
 
 @tool(name="schema-table-stats", description="List largest tables in a schema using QSYS2.SYSTABLESTAT.")
 def schema_table_stats(schema: str, limit: int = 200) -> str:
-    sch = _safe_schema(schema)
-    lim = _safe_limit(limit, default=200, max_n=5000)
-    return run_select(TABLE_STATS_SQL, parameters=[sch, lim])
+    try:
+        sch = _safe_schema(schema)
+        lim = _safe_limit(limit, default=200, max_n=5000)
+        return run_select(TABLE_STATS_SQL, parameters=[sch, lim])
+    except ValueError as e:
+        return f"ERROR: {e}"
+    except Exception as e:
+        return f"ERROR: {type(e).__name__}: {e}"
 
 @tool(name="table-index-stats", description="List index usage for a table using QSYS2.SYSINDEXSTAT.")
 def table_index_stats(schema: str, table: str, limit: int = 500) -> str:
-    sch = _safe_schema(schema)
-    tbl = _safe_ident(table, what="table")
-    lim = _safe_limit(limit, default=500, max_n=5000)
-    return run_select(INDEX_STATS_SQL, parameters=[sch, tbl, lim])
+    try:
+        sch = _safe_schema(schema)
+        tbl = _safe_ident(table, what="table")
+        lim = _safe_limit(limit, default=500, max_n=5000)
+        return run_select(INDEX_STATS_SQL, parameters=[sch, tbl, lim])
+    except ValueError as e:
+        return f"ERROR: {e}"
+    except Exception as e:
+        return f"ERROR: {type(e).__name__}: {e}"
 
 @tool(name="lock-waits", description="Show lock waits/contenders using QSYS2.LOCK_WAITS (if available).")
 def lock_waits(limit: int = 100) -> str:
@@ -1008,12 +1300,181 @@ def http_post_verbose(url: str, body: str) -> str:
     body = body or ""
     return run_select(HTTP_POST_VERBOSE_SQL, parameters=[url, body])
 
+@tool(name="http-patch-verbose", description="Call an HTTP PATCH using QSYS2.HTTP_PATCH_VERBOSE(url, body) (7.4 TR5+).")
+def http_patch_verbose(url: str, body: str) -> str:
+    """HTTP PATCH request - useful for partial resource updates."""
+    if not url or not (url.startswith("http://") or url.startswith("https://")):
+        return "ERROR: URL must start with http:// or https://"
+    body = body or ""
+    if not service_exists("QSYS2", "HTTP_PATCH_VERBOSE"):
+        return "ERROR: HTTP_PATCH_VERBOSE not available. Requires IBM i 7.4 TR5+ or 7.5+."
+    return run_select(HTTP_PATCH_VERBOSE_SQL, parameters=[url, body])
+
+@tool(name="http-delete-verbose", description="Call an HTTP DELETE using QSYS2.HTTP_DELETE_VERBOSE(url) (7.4 TR5+).")
+def http_delete_verbose(url: str) -> str:
+    """HTTP DELETE request - useful for resource deletion."""
+    if not url or not (url.startswith("http://") or url.startswith("https://")):
+        return "ERROR: URL must start with http:// or https://"
+    if not service_exists("QSYS2", "HTTP_DELETE_VERBOSE"):
+        return "ERROR: HTTP_DELETE_VERBOSE not available. Requires IBM i 7.4 TR5+ or 7.5+."
+    return run_select(HTTP_DELETE_VERBOSE_SQL, parameters=[url])
+
+# --- IBM i 7.5 NEW TOOLS ---
+@tool(name="security-info", description="Show system-wide security configuration using QSYS2.SECURITY_INFO.")
+def security_info() -> str:
+    """
+    Returns system security settings including password rules, auditing, and security level.
+    Useful for security compliance audits.
+    """
+    if not service_exists("QSYS2", "SECURITY_INFO"):
+        return "ERROR: SECURITY_INFO not available. Requires IBM i 7.3+."
+    return run_select(SECURITY_INFO_SQL)
+
+@tool(name="db-transaction-info", description="Show active database transactions using QSYS2.DB_TRANSACTION_INFO.")
+def db_transaction_info(limit: int = 100) -> str:
+    """
+    Returns active database transactions with lock information.
+    Useful for identifying long-running transactions and potential deadlocks.
+    """
+    if not service_exists("QSYS2", "DB_TRANSACTION_INFO"):
+        return "ERROR: DB_TRANSACTION_INFO not available. Requires IBM i 7.4+."
+    lim = _safe_limit(limit, default=100, max_n=1000)
+    return run_select(DB_TRANSACTION_INFO_SQL, parameters=[lim])
+
+@tool(name="active-jobs-detailed", description="Show active jobs with enhanced details (QRO hash, SQL text) using DETAILED_INFO='WORK'.")
+def active_jobs_detailed(limit: int = 50) -> str:
+    """
+    Returns active jobs with work management focused columns including SQL statement text.
+    Faster than 'ALL' and includes key performance metrics.
+    """
+    lim = _safe_limit(limit, default=50, max_n=500)
+    return run_select(ACTIVE_JOBS_DETAILED_SQL, parameters=[lim])
+
+@tool(name="netstat-job-info", description="Show network connections with owning job information using QSYS2.NETSTAT_JOB_INFO.")
+def netstat_job_info(limit: int = 100) -> str:
+    """
+    Returns established network connections with the job that owns each connection.
+    Useful for identifying which jobs have network activity.
+    """
+    if not service_exists("QSYS2", "NETSTAT_JOB_INFO"):
+        return "ERROR: NETSTAT_JOB_INFO not available. Requires IBM i 7.4+."
+    lim = _safe_limit(limit, default=100, max_n=1000)
+    return run_select(NETSTAT_JOB_INFO_SQL, parameters=[lim])
+
+@tool(name="joblog-info", description="Read job log messages for a specific job using QSYS2.JOBLOG_INFO.")
+def joblog_info(job_name: str, min_severity: int = 20, limit: int = 100) -> str:
+    """
+    Returns job log messages for a specified job.
+    Use qualified job name format: 123456/USER/JOBNAME or simple JOBNAME for current job.
+
+    min_severity: Minimum message severity (0-99, default 20 for informational+)
+    """
+    try:
+        if not service_exists("QSYS2", "JOBLOG_INFO"):
+            return "ERROR: JOBLOG_INFO not available. Requires IBM i 7.4+."
+        # Job name can be qualified (123456/USER/JOBNAME) or simple
+        job = job_name.strip() if job_name else "*"
+        sev = max(0, min(99, int(min_severity)))
+        lim = _safe_limit(limit, default=100, max_n=1000)
+        return run_select(JOBLOG_INFO_SQL, parameters=[job, sev, lim])
+    except ValueError as e:
+        return f"ERROR: {e}"
+    except Exception as e:
+        return f"ERROR: {type(e).__name__}: {e}"
+
+@tool(name="spooled-file-info", description="Show spooled files (print output) on the system using QSYS2.SPOOLED_FILE_INFO.")
+def spooled_file_info(limit: int = 100) -> str:
+    """
+    Returns spooled file information ordered by size.
+    Useful for identifying spool space usage and stuck print jobs.
+    """
+    if not service_exists("QSYS2", "SPOOLED_FILE_INFO"):
+        return "ERROR: SPOOLED_FILE_INFO not available. Requires IBM i 7.4+."
+    lim = _safe_limit(limit, default=100, max_n=1000)
+    return run_select(SPOOLED_FILE_INFO_SQL, parameters=[lim])
+
+@tool(name="ifs-object-stats", description="Show IFS (Integrated File System) object statistics using QSYS2.IFS_OBJECT_STATISTICS.")
+def ifs_object_stats(start_path: str = "/", min_size_bytes: int = 1048576, limit: int = 100) -> str:
+    """
+    Returns IFS objects larger than min_size_bytes under the specified path.
+    Default shows files >= 1MB. Use for storage analysis and cleanup.
+
+    start_path: Root path to scan (e.g., '/home', '/tmp')
+    min_size_bytes: Minimum file size to include (default 1MB)
+    """
+    try:
+        if not service_exists("QSYS2", "IFS_OBJECT_STATISTICS"):
+            return "ERROR: IFS_OBJECT_STATISTICS not available. Requires IBM i 7.2+."
+        path = start_path.strip() if start_path else "/"
+        min_size = max(0, int(min_size_bytes))
+        lim = _safe_limit(limit, default=100, max_n=1000)
+        return run_select(IFS_OBJECT_STATISTICS_SQL, parameters=[path, min_size, lim])
+    except ValueError as e:
+        return f"ERROR: {e}"
+    except Exception as e:
+        return f"ERROR: {type(e).__name__}: {e}"
+
+@tool(name="ifs-object-locks", description="Show jobs holding locks on an IFS object using QSYS2.IFS_OBJECT_LOCK_INFO.")
+def ifs_object_locks(path_name: str) -> str:
+    """
+    Returns jobs holding locks on the specified IFS path.
+    Useful for diagnosing 'file in use' errors.
+    """
+    try:
+        if not service_exists("QSYS2", "IFS_OBJECT_LOCK_INFO"):
+            return "ERROR: IFS_OBJECT_LOCK_INFO not available. Requires IBM i 7.4+."
+        path = path_name.strip() if path_name else ""
+        if not path:
+            return "ERROR: path_name is required"
+        return run_select(IFS_OBJECT_LOCK_INFO_SQL, parameters=[path])
+    except Exception as e:
+        return f"ERROR: {type(e).__name__}: {e}"
+
+@tool(name="system-values", description="Show system values using QSYS2.SYSTEM_VALUE_INFO.")
+def system_values(filter_pattern: str = "*ALL", limit: int = 200) -> str:
+    """
+    Returns system values. Use filter_pattern to search (e.g., 'QSEC%' for security values).
+    Use '*ALL' to show all system values.
+    """
+    try:
+        pattern = filter_pattern.strip().upper() if filter_pattern else "*ALL"
+        # Convert *ALL to SQL wildcard
+        sql_pattern = "%" if pattern == "*ALL" else pattern.replace("*", "%")
+        lim = _safe_limit(limit, default=200, max_n=1000)
+        return run_select(SYSTEM_VALUE_INFO_SQL, parameters=[pattern, sql_pattern, lim])
+    except Exception as e:
+        return f"ERROR: {type(e).__name__}: {e}"
+
+@tool(name="library-list-info", description="Show current job's library list using QSYS2.LIBRARY_LIST_INFO.")
+def library_list_info() -> str:
+    """
+    Returns the current job's library list with ordinal positions.
+    Shows system, product, current, and user library list portions.
+    """
+    return run_select(LIBRARY_LIST_INFO_SQL)
+
+@tool(name="hardware-resource-info", description="Show hardware configuration using QSYS2.HARDWARE_RESOURCE_INFO.")
+def hardware_resource_info(limit: int = 200) -> str:
+    """
+    Returns hardware resources (processors, memory, disks, adapters).
+    Useful for capacity planning and hardware inventory.
+    """
+    if not service_exists("QSYS2", "HARDWARE_RESOURCE_INFO"):
+        return "ERROR: HARDWARE_RESOURCE_INFO not available. Requires IBM i 7.3+."
+    lim = _safe_limit(limit, default=200, max_n=1000)
+    return run_select(HARDWARE_RESOURCE_INFO_SQL, parameters=[lim])
+
 # --- Library / Object sizing ---
 @tool(name="largest-objects", description="Find largest objects in a library using QSYS2.OBJECT_STATISTICS.")
 def largest_objects(library: str, limit: int = 50) -> str:
-    lib = _safe_ident_or_special(library, what="library")
-    lim = _safe_limit(limit, default=50, max_n=5000)
-    return run_select(LARGEST_OBJECTS_SQL, parameters=[lib, lim])
+    try:
+        lib = _safe_ident_or_special(library, what="library")
+        lim = _safe_limit(limit, default=50, max_n=5000)
+        return run_select(LARGEST_OBJECTS_SQL, parameters=[lib, lim])
+    except ValueError as e:
+        return f"ERROR: {e}"
+    except Exception as e:
+        return f"ERROR: {type(e).__name__}: {e}"
 
 @tool(name="library-sizes", description="List libraries and their sizes using QSYS2.LIBRARY_INFO. Can exclude system libraries.")
 def library_sizes(limit: int = 100, exclude_system: bool = False) -> str:
@@ -1024,22 +1485,37 @@ def library_sizes(limit: int = 100, exclude_system: bool = False) -> str:
 # --- Data Governance / Metadata ---
 @tool(name="list-tables-in-schema", description="List tables/views in a schema using QSYS2.SYSTABLES.")
 def list_tables_in_schema(schema: str, limit: int = 5000) -> str:
-    sch = _safe_schema(schema)
-    lim = _safe_limit(limit, default=5000, max_n=50000)
-    return run_select(SYSTABLES_IN_SCHEMA_SQL, parameters=[sch, lim])
+    try:
+        sch = _safe_schema(schema)
+        lim = _safe_limit(limit, default=5000, max_n=50000)
+        return run_select(SYSTABLES_IN_SCHEMA_SQL, parameters=[sch, lim])
+    except ValueError as e:
+        return f"ERROR: {e}"
+    except Exception as e:
+        return f"ERROR: {type(e).__name__}: {e}"
 
 @tool(name="describe-table", description="Describe a table's columns using QSYS2.SYSCOLUMNS.")
 def describe_table(schema: str, table: str, limit: int = 5000) -> str:
-    sch = _safe_schema(schema)
-    tbl = _safe_ident(table, what="table")
-    lim = _safe_limit(limit, default=5000, max_n=50000)
-    return run_select(SYSCOLUMNS_FOR_TABLE_SQL, parameters=[sch, tbl, lim])
+    try:
+        sch = _safe_schema(schema)
+        tbl = _safe_ident(table, what="table")
+        lim = _safe_limit(limit, default=5000, max_n=50000)
+        return run_select(SYSCOLUMNS_FOR_TABLE_SQL, parameters=[sch, tbl, lim])
+    except ValueError as e:
+        return f"ERROR: {e}"
+    except Exception as e:
+        return f"ERROR: {type(e).__name__}: {e}"
 
 @tool(name="list-routines-in-schema", description="List routines (procedures/functions) in a schema using QSYS2.SYSROUTINES.")
 def list_routines_in_schema(schema: str, limit: int = 2000) -> str:
-    sch = _safe_schema(schema)
-    lim = _safe_limit(limit, default=2000, max_n=50000)
-    return run_select(SYSROUTINES_IN_SCHEMA_SQL, parameters=[sch, lim])
+    try:
+        sch = _safe_schema(schema)
+        lim = _safe_limit(limit, default=2000, max_n=50000)
+        return run_select(SYSROUTINES_IN_SCHEMA_SQL, parameters=[sch, lim])
+    except ValueError as e:
+        return f"ERROR: {e}"
+    except Exception as e:
+        return f"ERROR: {type(e).__name__}: {e}"
 
 # --- Logging (optional write tool) ---
 @tool(name="log-performance-metrics", description="Save performance metrics to SAMPLE.METRICS for trend history (requires table).")
@@ -1237,6 +1713,45 @@ def subsystem_routing_info(subsystem: str = "", limit: int = 500) -> str:
     else:
         return run_select(SUBSYSTEM_ROUTING_INFO_SQL, parameters=[None, None, lim])
 
+@tool(name="active-jobs-full", description="Fast active job query excluding slow columns using DETAILED_INFO='FULL' (7.6).")
+def active_jobs_full(limit: int = 100) -> str:
+    """
+    Returns active jobs using DETAILED_INFO='FULL' which excludes slow-to-access columns.
+    Faster than 'ALL' or 'WORK' for quick job snapshots.
+    Requires IBM i 7.6 or specific PTF on 7.5.
+    """
+    lim = _safe_limit(limit, default=100, max_n=1000)
+    return run_select(ACTIVE_JOBS_FULL_SQL, parameters=[lim])
+
+@tool(name="disk-block-size-info", description="Show disk configuration with block size info using QSYS2.SYSDISKSTAT.")
+def disk_block_size_info(limit: int = 100) -> str:
+    """
+    Returns disk unit statistics including capacity, usage, and protection settings.
+    Useful for storage planning and identifying disk hotspots.
+    """
+    lim = _safe_limit(limit, default=100, max_n=500)
+    return run_select(DISK_BLOCK_SIZE_SQL, parameters=[lim])
+
+@tool(name="subsystem-pool-info", description="Show memory pool allocations for subsystems using QSYS2.SUBSYSTEM_POOL_INFO.")
+def subsystem_pool_info(limit: int = 200) -> str:
+    """
+    Returns subsystem memory pool configurations.
+    Shows defined vs current size, activity levels, and paging options.
+    """
+    if not service_exists("QSYS2", "SUBSYSTEM_POOL_INFO"):
+        return "ERROR: SUBSYSTEM_POOL_INFO not available. Requires IBM i 7.4+."
+    lim = _safe_limit(limit, default=200, max_n=1000)
+    return run_select(SUBSYSTEM_POOL_INFO_SQL, parameters=[lim])
+
+@tool(name="ptf-supersession", description="Show PTFs that have been superseded using QSYS2.PTF_INFO.")
+def ptf_supersession(limit: int = 200) -> str:
+    """
+    Returns PTFs that have been superseded by newer PTFs.
+    Useful for PTF cleanup and ensuring you're running the latest fixes.
+    """
+    lim = _safe_limit(limit, default=200, max_n=1000)
+    return run_select(PTF_SUPERSESSION_SQL, parameters=[lim])
+
 
 # =============================================================================
 # PROGRAM SOURCE CODE ANALYSIS (NEW TOOLS)
@@ -1250,11 +1765,15 @@ def get_program_source_info(library: str, program: str, limit: int = 10) -> str:
 
     Use library='*ALL' to search all libraries, or specify a library name.
     """
-    lib = _safe_ident_or_special(library, what="library")
-    pgm = _safe_ident(program, what="program")
-    lim = _safe_limit(limit, default=10, max_n=100)
-
-    return run_select(PROGRAM_SOURCE_INFO_SQL, parameters=[lib, pgm, lim])
+    try:
+        lib = _safe_ident_or_special(library, what="library")
+        pgm = _safe_ident(program, what="program")
+        lim = _safe_limit(limit, default=10, max_n=100)
+        return run_select(PROGRAM_SOURCE_INFO_SQL, parameters=[lib, pgm, lim])
+    except ValueError as e:
+        return f"ERROR: {e}"
+    except Exception as e:
+        return f"ERROR: {type(e).__name__}: {e}"
 
 
 @tool(name="read-source-member", description="Read source code from a source physical file member.")
@@ -1265,16 +1784,16 @@ def read_source_member(library: str, source_file: str, member: str, limit: int =
 
     SAFETY: This respects schema whitelist - source file must be in allowed schema.
     """
-    lib = _safe_schema(library)  # Validates against whitelist
-    srcf = _safe_ident(source_file, what="source_file")
-    mbr = _safe_ident(member, what="member")
-    lim = _safe_limit(limit, default=1000, max_n=10000)
-
-    # Log if reading from user schema
-    if lib in _USER_SCHEMAS:
-        print(f"[USER_SCHEMA_ACCESS] Reading source: {lib}/{srcf}({mbr})", file=sys.stderr)
-
     try:
+        lib = _safe_schema(library)  # Validates against whitelist
+        srcf = _safe_ident(source_file, what="source_file")
+        mbr = _safe_ident(member, what="member")
+        lim = _safe_limit(limit, default=1000, max_n=10000)
+
+        # Log if reading from user schema
+        if lib in _USER_SCHEMAS:
+            print(f"[USER_SCHEMA_ACCESS] Reading source: {lib}/{srcf}({mbr})", file=sys.stderr)
+
         # Get member metadata
         metadata = run_select(SOURCE_MEMBER_INFO_SQL, parameters=[lib, srcf, mbr])
 
@@ -1283,8 +1802,10 @@ def read_source_member(library: str, source_file: str, member: str, limit: int =
         source = run_select(sql)
 
         return f"=== Member Metadata ===\n{metadata}\n\n=== Source Code ===\n{source}"
+    except ValueError as e:
+        return f"ERROR: {e}"
     except Exception as e:
-        return f"ERROR reading source member. Details: {type(e).__name__}: {e}"
+        return f"ERROR reading source member: {type(e).__name__}: {e}"
 
 
 @tool(name="analyze-program-dependencies", description="Show what objects a program references using QSYS2.PROGRAM_REFERENCES.")
@@ -1292,14 +1813,19 @@ def analyze_program_dependencies(library: str, program: str, limit: int = 500) -
     """
     Returns list of objects referenced by a program (calls, file usage, etc.).
     """
-    if not service_exists("QSYS2", "PROGRAM_REFERENCES"):
-        return "ERROR: PROGRAM_REFERENCES not available. May require IBM i 7.4+ or PTF."
+    try:
+        if not service_exists("QSYS2", "PROGRAM_REFERENCES"):
+            return "ERROR: PROGRAM_REFERENCES not available. May require IBM i 7.4+ or PTF."
 
-    lib = _safe_ident(library, what="library")
-    pgm = _safe_ident(program, what="program")
-    lim = _safe_limit(limit, default=500, max_n=5000)
+        lib = _safe_ident(library, what="library")
+        pgm = _safe_ident(program, what="program")
+        lim = _safe_limit(limit, default=500, max_n=5000)
 
-    return run_select(PROGRAM_REFERENCES_SQL, parameters=[lib, pgm, lim])
+        return run_select(PROGRAM_REFERENCES_SQL, parameters=[lib, pgm, lim])
+    except ValueError as e:
+        return f"ERROR: {e}"
+    except Exception as e:
+        return f"ERROR: {type(e).__name__}: {e}"
 
 
 # =============================================================================
@@ -1334,15 +1860,9 @@ def query_user_table(schema: str, table: str, where_clause: str = "",
                    f"User schemas: {sorted(_USER_SCHEMAS)}. " \
                    f"To enable: Set ALLOWED_USER_SCHEMAS={sch} in .env"
 
-        # Validate WHERE and ORDER BY don't contain dangerous tokens
-        if where_clause:
-            if _FORBIDDEN_SQL_TOKENS.search(where_clause):
-                return "ERROR: Forbidden SQL operation in WHERE clause"
-
-        if order_by:
-            # Basic validation - should only be column names and ASC/DESC
-            if _FORBIDDEN_SQL_TOKENS.search(order_by) or "(" in order_by:
-                return "ERROR: Forbidden SQL operation in ORDER BY clause"
+        # Validate WHERE and ORDER BY clauses (prevents subqueries, injection)
+        where_clause = _validate_simple_clause(where_clause, "WHERE")
+        order_by = _validate_simple_clause(order_by, "ORDER BY")
 
         # Log user schema access
         if sch in _USER_SCHEMAS:
@@ -1365,16 +1885,21 @@ def describe_user_table(schema: str, table: str) -> str:
     Returns column metadata for a user table.
     Same as describe-table but with explicit user-schema logging.
     """
-    sch = _safe_schema(schema)
-    tbl = _safe_ident(table, what="table")
+    try:
+        sch = _safe_schema(schema)
+        tbl = _safe_ident(table, what="table")
 
-    if sch not in _ALLOWED_SCHEMAS:
-        return f"ERROR: Schema {sch} is not in allowed schemas."
+        if sch not in _ALLOWED_SCHEMAS:
+            return f"ERROR: Schema {sch} is not in allowed schemas."
 
-    if sch in _USER_SCHEMAS:
-        print(f"[USER_SCHEMA_ACCESS] Describe table: {sch}.{tbl}", file=sys.stderr)
+        if sch in _USER_SCHEMAS:
+            print(f"[USER_SCHEMA_ACCESS] Describe table: {sch}.{tbl}", file=sys.stderr)
 
-    return run_select(SYSCOLUMNS_FOR_TABLE_SQL, parameters=[sch, tbl, 5000])
+        return run_select(SYSCOLUMNS_FOR_TABLE_SQL, parameters=[sch, tbl, 5000])
+    except ValueError as e:
+        return f"ERROR: {e}"
+    except Exception as e:
+        return f"ERROR: {type(e).__name__}: {e}"
 
 
 @tool(name="count-user-table-rows", description="Count rows in a user table (fast metadata query).")
@@ -1383,17 +1908,22 @@ def count_user_table_rows(schema: str, table: str) -> str:
     Returns row count for a table using metadata.
     Fast operation that doesn't scan the table.
     """
-    sch = _safe_schema(schema)
-    tbl = _safe_ident(table, what="table")
+    try:
+        sch = _safe_schema(schema)
+        tbl = _safe_ident(table, what="table")
 
-    if sch not in _ALLOWED_SCHEMAS:
-        return f"ERROR: Schema {sch} is not in allowed schemas."
+        if sch not in _ALLOWED_SCHEMAS:
+            return f"ERROR: Schema {sch} is not in allowed schemas."
 
-    if sch in _USER_SCHEMAS:
-        print(f"[USER_SCHEMA_ACCESS] Count rows: {sch}.{tbl}", file=sys.stderr)
+        if sch in _USER_SCHEMAS:
+            print(f"[USER_SCHEMA_ACCESS] Count rows: {sch}.{tbl}", file=sys.stderr)
 
-    sql = "SELECT NUMBER_ROWS, NUMBER_DELETED_ROWS, DATA_SIZE FROM QSYS2.SYSTABLESTAT WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?"
-    return run_select(sql, parameters=[sch, tbl])
+        sql = "SELECT NUMBER_ROWS, NUMBER_DELETED_ROWS, DATA_SIZE FROM QSYS2.SYSTABLESTAT WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?"
+        return run_select(sql, parameters=[sch, tbl])
+    except ValueError as e:
+        return f"ERROR: {e}"
+    except Exception as e:
+        return f"ERROR: {type(e).__name__}: {e}"
 
 
 # =============================================================================
@@ -1427,8 +1957,8 @@ def build_super_agent() -> Agent:
         # HA/DR / Journaling
         journals, journal_receivers,
 
-        # Integration
-        http_get_verbose, http_post_verbose,
+        # Integration (HTTP)
+        http_get_verbose, http_post_verbose, http_patch_verbose, http_delete_verbose,
 
         # Library sizing
         largest_objects, library_sizes,
@@ -1442,10 +1972,16 @@ def build_super_agent() -> Agent:
         # Templates
         generate_runbook, generate_checklist,
 
+        # IBM i 7.5 NEW Tools
+        security_info, db_transaction_info, active_jobs_detailed, netstat_job_info,
+        joblog_info, spooled_file_info, ifs_object_stats, ifs_object_locks,
+        system_values, library_list_info, hardware_resource_info,
+
         # IBM i 7.6 Services (NEW)
         ifs_authority_collection, verify_name, lookup_sqlstate,
         dump_plan_cache_qro, certificate_usage_info, user_mfa_settings,
-        subsystem_routing_info,
+        subsystem_routing_info, active_jobs_full, disk_block_size_info,
+        subsystem_pool_info, ptf_supersession,
 
         # Program Source Analysis (NEW)
         get_program_source_info, read_source_member,
@@ -1469,14 +2005,28 @@ def build_super_agent() -> Agent:
         - If a tool returns an ERROR (missing service, permissions, etc.):
           explain it clearly and propose alternatives (e.g., search-sql-services).
 
+        IBM i 7.5 Enhanced Tools:
+        - security-info: System-wide security configuration
+        - db-transaction-info: Active transactions and deadlock detection
+        - active-jobs-detailed: Jobs with SQL text and QRO hash
+        - netstat-job-info: Network connections with owning jobs
+        - joblog-info: Read job log messages
+        - spooled-file-info: Spool file (print) monitoring
+        - ifs-object-stats: IFS storage analysis
+        - ifs-object-locks: IFS file lock diagnostics
+        - system-values: Query system values
+        - library-list-info: Current library list
+        - hardware-resource-info: Hardware inventory
+        - http-patch-verbose, http-delete-verbose: Extended HTTP methods
+
         IBM i 7.6 Enhancements:
-        - NEW: IFS authority analysis (ifs-authority-collection)
-        - NEW: Name validation (verify-name)
-        - NEW: SQLSTATE lookup (lookup-sqlstate)
-        - NEW: Enhanced plan cache (dump-plan-cache-qro)
-        - NEW: Certificate tracking (certificate-usage-info)
-        - NEW: MFA settings (user-mfa-settings)
-        - NEW: Subsystem routing (subsystem-routing-info)
+        - ifs-authority-collection: IFS authority analysis
+        - verify-name: Name validation
+        - lookup-sqlstate: SQLSTATE lookup
+        - dump-plan-cache-qro: Enhanced plan cache
+        - certificate-usage-info: Certificate tracking
+        - user-mfa-settings: MFA settings
+        - subsystem-routing-info: Subsystem routing
 
         User Schema Access (Business Data):
         - If ALLOWED_USER_SCHEMAS is configured, you can query user business data
@@ -1527,9 +2077,12 @@ def main() -> None:
     _ = get_ibmi_credentials()
     _ = _require_env("OPENROUTER_API_KEY")
 
+    # Preload available IBM i services for faster tool execution
+    service_count = preload_services()
+
     agent = build_super_agent()
 
-    print("\n✅ IBM i Super Agent is ready (IBM i 7.6 Edition - 55 tools).")
+    print(f"\n✅ IBM i Super Agent is ready (IBM i 7.6 Edition - {len(agent.tools)} tools, {service_count} services detected).")
     print("Try questions like:")
     print(" - 'What are the top CPU jobs right now?'")
     print(" - 'Any jobs stuck in MSGW? Show details.'")
