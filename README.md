@@ -20,6 +20,36 @@ The AI agent will automatically:
 3. Analyze the results
 4. Provide clear recommendations and next steps
 
+## 🚀 Quick Start (2 Commands)
+
+Get up and running in under a minute:
+
+**Windows PowerShell:**
+```powershell
+git clone https://github.com/PIO-Anurag-Garg/IBM_i_Agent.git
+cd IBM_i_Agent
+.\setup.ps1
+```
+
+**macOS/Linux:**
+```bash
+git clone https://github.com/PIO-Anurag-Garg/IBM_i_Agent.git
+cd IBM_i_Agent
+chmod +x setup.sh && ./setup.sh
+```
+
+The setup script automatically:
+- Checks Python 3.8+ is installed
+- Creates a virtual environment
+- Installs all dependencies
+- Creates `.env` from template
+
+**Then just:**
+1. Edit `.env` with your IBM i credentials and [OpenRouter API key](https://openrouter.ai/settings/keys)
+2. Run `python ibmi_agent.py`
+
+> For detailed manual installation, see [Installation](#-installation) section below.
+
 ## ✨ Key Features
 
 ### System Performance & Monitoring
