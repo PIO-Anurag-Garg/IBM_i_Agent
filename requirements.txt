@@ -3,3 +3,4 @@ mapepire-python
 pep249
 agno
 openai
+rich

@@ -46,7 +46,11 @@ The setup script automatically:
 
 **Then just:**
 1. Edit `.env` with your IBM i credentials and [OpenRouter API key](https://openrouter.ai/settings/keys)
-2. Run `python ibmi_agent.py`
+2. Run one of the agents:
+   - `python agents/ibmi_agent.py` - Main agent (recommended)
+   - `python agents/ibmi_parallel_agent.py` - Parallel execution (3-4x faster)
+   - `python agents/ibmi_multi_agent.py` - Multi-agent with intelligent routing
+   - `python agents/new_IBMi_agent.py` - Dynamic text-to-SQL with streaming UI
 
 > For detailed manual installation, see [Installation](#-installation) section below.
 
@@ -310,8 +314,13 @@ pip install python-dotenv mapepire-python agno openai
 Test that everything is set up correctly:
 
 ```bash
-python ibmi_agent.py
+python agents/ibmi_agent.py
 ```
+
+Or try one of the other agent implementations:
+- `python agents/ibmi_parallel_agent.py` - Parallel execution
+- `python agents/ibmi_multi_agent.py` - Multi-agent orchestrator
+- `python agents/new_IBMi_agent.py` - Dynamic text-to-SQL
 
 If successful, you should see:
 
@@ -553,7 +562,7 @@ This project is provided as-is for educational and operational purposes. Please 
 - [ ] IBM i credentials obtained
 - [ ] OpenRouter API key obtained
 - [ ] `.env` file created and configured
-- [ ] Successfully ran `python ibmi_agent.py`
+- [ ] Successfully ran `python agents/ibmi_agent.py` (or another agent)
 - [ ] Asked first question and got response!
 
 ---
